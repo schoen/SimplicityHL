@@ -1358,9 +1358,10 @@ impl Scope {
     /// An enum is a type alias for a nominal enum type, so its name resolves as a type
     /// and its identity travels wherever the alias is imported.
     ///
-    /// Enums may only be declared at the top level of the program's own files
-    /// (the parser rejects declarations inside `mod` blocks, the driver rejects them in dependency files),
-    /// so the bare name is unique program-wide and identifies the enum in the ABI.
+    /// The enum's identity is the path of the module it is declared in together
+    /// with its declared name, so two same-named enums declared in different
+    /// modules are different types. That qualified name is what the ABI prints
+    /// and what a witness file names the type by.
     ///
     /// ## Errors
     ///
@@ -1373,7 +1374,8 @@ impl Scope {
     ) -> Result<(), Error> {
         self.check_alias_free(&name)?;
 
-        let info = EnumInfo::new(Arc::clone(name.as_inner()), variants);
+        let module_path = Arc::from(self.module_path.as_slice());
+        let info = EnumInfo::new_in_module(module_path, Arc::clone(name.as_inner()), variants);
         let resolved = ResolvedType::enumeration(info);
 
         self.current_module_mut()
@@ -1851,14 +1853,19 @@ fn analyze_enum_construction(
                     found: resolved,
                 })
                 .with_span(span)?,
-                Err(_) => scope.unscoped_enum_names && written == info.name(),
+                Err(_) => scope.unscoped_enum_names && written == info.qualified_name(),
             }
         }
-        _ => false,
+        // Value files (witness and argument) name a nested enum by its
+        // qualified path, which has more than one segment.
+        _ => scope.unscoped_enum_names && written == info.qualified_name(),
     };
     if !names_expected_enum {
         Err(Error::Grammar {
-            msg: format!("`{written}` does not name enum `{}`", info.name()),
+            msg: format!(
+                "`{written}` does not name enum `{}`",
+                info.qualified_name()
+            ),
         })
         .with_span(span)?;
     }
@@ -2192,8 +2199,9 @@ impl AbstractSyntaxTree for EnumMatch {
         let [single] = arms[0].enum_path() else {
             return Err(Error::Grammar {
                 msg: format!(
-                    "`{enum_name}` does not name an enum; enums are declared at the \
-                     top level, so match arms name them by a single identifier"
+                    "`{enum_name}` does not name an enum; match arms name an enum \
+                     by a single identifier that is in scope, so import it with \
+                     `use` if it is declared in another module"
                 ),
             })
             .with_span(span)
@@ -3795,41 +3803,140 @@ mod enum_tests {
     }
 
     #[test]
-    fn enum_declaration_inside_module_errors() {
-        // FIXME: Enums may only be declared at the top level of a file.
+    fn enum_declaration_inside_module_is_allowed() {
+        // An enum's identity is its declaring module path plus its name, so
+        // a `mod` block is a legal place to declare one.
         let result = analyze(
             "mod m {
                  pub enum Choice { X, Y, }
              }
-             fn main() {}",
+             use crate::m::Choice;
+             fn main() {
+                 let _c: Choice = Choice::X;
+             }",
         );
-        let err = result.expect_err("enum inside `mod` must be rejected");
         assert!(
-            err.contains("top level"),
-            "error should say enums are top-level only: {err}"
+            result.is_ok(),
+            "enum inside `mod` should be accepted: {:?}",
+            result.err()
         );
     }
 
     #[test]
-    fn enum_declaration_in_dependency_errors() {
+    fn same_named_enums_in_different_modules_are_distinct() {
+        // The case the generated module names could not express: two enums
+        // that share a name but not a declaring module.
+        let result = analyze(
+            "mod a {
+                 pub enum Kind { Cold, Hot, }
+             }
+             mod b {
+                 pub enum Kind { Cold, Hot, }
+             }
+             use crate::a::Kind as AKind;
+             use crate::b::Kind as BKind;
+             fn main() {
+                 let x: AKind = AKind::Hot;
+                 let _y: BKind = x;
+             }",
+        );
+        let err = result.expect_err("two same-named enums must not be interchangeable");
+        assert!(
+            err.contains("a::Kind") && err.contains("b::Kind"),
+            "the error should name both qualified enums: {err}"
+        );
+    }
+
+    #[test]
+    fn same_enum_through_two_paths_is_one_type() {
+        // Re-exports and aliases are ways of naming a type, not new types.
+        let result = analyze(
+            "mod a {
+                 pub enum Kind { Cold, Hot, }
+             }
+             mod b {
+                 pub use crate::a::Kind;
+             }
+             use crate::a::Kind as Direct;
+             use crate::b::Kind as ViaReexport;
+             fn main() {
+                 let x: Direct = Direct::Hot;
+                 let _y: ViaReexport = x;
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "one enum reached by two paths must be one type: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn nested_module_enum_is_qualified_by_its_full_path() {
+        let result = analyze(
+            "mod outer {
+                 pub mod inner {
+                     pub enum Kind { Cold, Hot, }
+                 }
+             }
+             enum Kind { Cold, Hot, }
+             use crate::outer::inner::Kind as Nested;
+             fn main() {
+                 let x: Nested = Nested::Hot;
+                 let _y: Kind = x;
+             }",
+        );
+        let err = result.expect_err("a nested enum must differ from a root enum of the same name");
+        assert!(
+            err.contains("outer::inner::Kind"),
+            "the error should carry the full module path: {err}"
+        );
+    }
+
+    #[test]
+    fn enum_declaration_in_dependency_is_allowed() {
         use crate::ast::scope_resolution_tests::analyze_multifile;
 
-        // FIXME: An enum's declared name is its identity in the ABI, so enums may only be declared in the program's own files.
+        // A dependency's file lands at `lib::A`, so an enum it declares is
+        // `lib::A::Status`: a name the user can predict and write.
         let result = analyze_multifile(vec![
             (
                 "main.simf",
-                "use lib::A::helper;
-                 fn main() { helper(); }",
+                "use lib::A::{helper, Status};
+                 fn main() { helper(); let _s: Status = Status::On; }",
             ),
             (
                 "libs/lib/A.simf",
                 "pub enum Status { On, Off, } pub fn helper() {}",
             ),
         ]);
-        let err = result.expect_err("enums in dependency files must be rejected");
         assert!(
-            err.contains("dependency"),
-            "error should say enums cannot live in dependency files: {err}"
+            result.is_ok(),
+            "an enum declared in a dependency should be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn dependency_enum_differs_from_a_root_enum_of_the_same_name() {
+        use crate::ast::scope_resolution_tests::analyze_multifile;
+
+        let result = analyze_multifile(vec![
+            (
+                "main.simf",
+                "use lib::A::Status as LibStatus;
+                 enum Status { On, Off, }
+                 fn main() {
+                     let x: LibStatus = LibStatus::On;
+                     let _y: Status = x;
+                 }",
+            ),
+            ("libs/lib/A.simf", "pub enum Status { On, Off, }"),
+        ]);
+        let err = result.expect_err("a dependency's enum is not the program's own enum");
+        assert!(
+            err.contains("lib::A::Status"),
+            "the error should name the dependency's enum by its module path: {err}"
         );
     }
 

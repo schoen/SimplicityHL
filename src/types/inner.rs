@@ -3,7 +3,7 @@ use core::str::FromStr;
 use std::sync::Arc;
 
 use crate::num::{NonZeroPow2Usize, Pow2Usize};
-use crate::str::Identifier;
+use crate::str::{Identifier, ModuleName};
 
 use super::{ResolvedType, StructuralType, TypeConstructible as _};
 
@@ -92,7 +92,7 @@ impl<A> TypeInner<A> {
                     write!(f, ", {bound}>")
                 }
             },
-            TypeInner::Enum(info) => write!(f, "{}", info.name()),
+            TypeInner::Enum(info) => write!(f, "{}", info.qualified_name()),
             TypeInner::Never => f.write_str("!"),
         }
     }
@@ -230,11 +230,16 @@ impl FromStr for UIntType {
 /// unrepresentable. A variant's position among the declared variants
 /// determines its leaf in the sum; there is no separate discriminant.
 ///
-/// Identity is the declared name: enums may only be declared at the top
-/// level of the program's own files, so the name is unique program-wide and
-/// serialized forms (such as the ABI) can identify an enum by it.
+/// Identity is the declaring module path together with the declared name.
+/// Two enums of the same name declared in different modules are different
+/// types; the same enum reached by different `use` paths or re-exports is
+/// one type. The qualified name is what diagnostics, the ABI and witness
+/// files use to name the type.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct EnumInfo {
+    /// Path of the module the enum was declared in, outermost first.
+    /// Empty for an enum declared at the root of the program.
+    module_path: Arc<[ModuleName]>,
     name: Arc<str>,
     variants: Arc<[EnumVariantInfo]>,
 }
@@ -246,13 +251,56 @@ impl EnumInfo {
     /// uninhabited, which Simplicity's type algebra cannot express.
     /// A single-variant enum is a named wrapper of its payload.
     pub(crate) fn new(name: Arc<str>, variants: Arc<[EnumVariantInfo]>) -> Self {
-        debug_assert!(!variants.is_empty());
-        Self { name, variants }
+        let root: [ModuleName; 0] = [];
+        Self::new_in_module(Arc::from(root), name, variants)
     }
 
-    /// Access the declared name of the enum.
+    /// Create an enum definition declared in the module at `module_path`.
+    ///
+    /// `variants` must not be empty: a sum of zero types would be
+    /// uninhabited, which Simplicity's type algebra cannot express.
+    /// A single-variant enum is a named wrapper of its payload.
+    pub(crate) fn new_in_module(
+        module_path: Arc<[ModuleName]>,
+        name: Arc<str>,
+        variants: Arc<[EnumVariantInfo]>,
+    ) -> Self {
+        debug_assert!(!variants.is_empty());
+        Self {
+            module_path,
+            name,
+            variants,
+        }
+    }
+
+    /// Access the declared name of the enum, without its module path.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Access the path of the module the enum was declared in.
+    /// Empty for an enum declared at the root of the program.
+    pub fn module_path(&self) -> &[ModuleName] {
+        &self.module_path
+    }
+
+    /// The enum's identity as written: the declaring module path and the
+    /// declared name, joined by `::`. For an enum declared at the root of
+    /// the program this is just the declared name.
+    pub fn qualified_name(&self) -> String {
+        if self.module_path.is_empty() {
+            return self.name.to_string();
+        }
+
+        let mut qualified = self
+            .module_path
+            .iter()
+            .map(ModuleName::as_str)
+            .collect::<Vec<_>>()
+            .join("::");
+        qualified.push_str("::");
+        qualified.push_str(&self.name);
+        qualified
     }
 
     /// Access the variants of the enum in declaration order.

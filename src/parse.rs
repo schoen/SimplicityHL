@@ -3172,27 +3172,6 @@ impl Module {
                 items,
                 span: e.span(),
             })
-            .validate(|module, _, emit| {
-                // TODO: Enums may only be declared at the top level of a file (done so to reduce scope of the PR).
-                // The bare name is the enum's identity in the ABI, and a module path would obscure it.
-                // Direct children suffice. Nested modules validate their own items.
-                for item in module.items.iter() {
-                    if let Item::EnumDeclaration(decl) = item {
-                        emit.emit(
-                            Error::Grammar {
-                                msg: format!(
-                                    "enum `{}` is declared inside `mod {}`; enums may \
-                                     only be declared at the top level of a file",
-                                    decl.name(),
-                                    module.name
-                                ),
-                            }
-                            .with_span(decl.into()),
-                        );
-                    }
-                }
-                module
-            })
     }
 }
 
@@ -3299,10 +3278,10 @@ impl<'a> arbitrary::Arbitrary<'a> for Program {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let mut items_vec = generate_arbitrary_items(u)?;
 
-        // Enum declarations are valid only at the top level of a file, so
-        // they are generated here and not in `generate_arbitrary_items`,
-        // which `Module::arbitrary` reuses for nested items: a nested enum
-        // would display to source that no longer parses.
+        // Enum declarations are generated here rather than in
+        // `generate_arbitrary_items` (which `Module::arbitrary` reuses for
+        // nested items) only to keep the generated shape simple; a nested
+        // enum declaration is valid and displays to source that re-parses.
         //
         // TODO(enums): declarations alone leave construction, matching,
         // payload binding, and compilation unreached — the expression

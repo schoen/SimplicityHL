@@ -1,0 +1,7 @@
+use lib::module::add;
+
+// The dependency is rooted at the `lib` directory, so it contributes a
+// module named `lib` at the root of the program. This collides with it.
+mod lib {}
+
+fn main() {}

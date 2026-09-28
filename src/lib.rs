@@ -1919,10 +1919,12 @@ mod functional_tests {
         run_dependency_test(format!("{}/module-simple", VALID_TESTS_DIR).as_str(), "lib");
     }
 
+    /// A module declared in the entry file sits beside the modules generated
+    /// for dependencies, so the two must coexist without interfering.
     #[test]
-    fn module_name_simple() {
+    fn module_beside_dependency() {
         run_dependency_test(
-            format!("{}/module-name-collision", VALID_TESTS_DIR).as_str(),
+            format!("{}/module-beside-dependency", VALID_TESTS_DIR).as_str(),
             "lib",
         );
     }
@@ -1989,6 +1991,15 @@ mod functional_tests {
     }
 
     // Error tests
+    #[test]
+    #[should_panic(expected = "has the same name as the module a dependency")]
+    fn module_name_collides_with_dependency_error() {
+        run_dependency_test(
+            format!("{}/module-name-collides-with-dependency", ERROR_TESTS_DIR).as_str(),
+            "lib",
+        );
+    }
+
     #[test]
     #[should_panic(expected = "Circular dependency detected:")]
     fn cyclic_dependency_error() {

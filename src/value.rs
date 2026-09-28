@@ -465,7 +465,14 @@ impl fmt::Display for Value {
                     match data.n_children_yielded {
                         0 => {
                             let info = data.node.ty().as_enum().expect("value is type-checked");
-                            write!(f, "{}::{}", info.name(), info.variants()[*index].name())?;
+                            // The qualified name, so the printed value parses
+                            // back to this same type (`analyze_enum_construction`).
+                            write!(
+                                f,
+                                "{}::{}",
+                                info.qualified_name(),
+                                info.variants()[*index].name()
+                            )?;
                             if !payload.is_empty() {
                                 f.write_str("(")?;
                             }

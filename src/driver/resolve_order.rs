@@ -1,56 +1,105 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::driver::{DependencyGraph, CRATE_STR, MAIN_MODULE, MAIN_STR};
 use crate::error::{Diagnostic, DiagnosticManager, Error, Span};
 use crate::parse::{self, Visibility};
+use crate::resolution::is_valid_dependency_identifier;
+use crate::source::CanonPath;
 use crate::str::{Identifier, ModuleName};
 
-/// All enum declarations among `items`, recursing into `mod` blocks.
-fn enum_declarations(items: &[parse::Item]) -> Vec<&parse::EnumDeclaration> {
-    let mut found = Vec::new();
-    for item in items {
-        match item {
-            parse::Item::EnumDeclaration(decl) => found.push(decl),
-            parse::Item::Module(module) => found.extend(enum_declarations(module.items())),
-            _ => {}
-        }
-    }
-    found
+/// A file's items, placed at the module path the file occupies.
+///
+/// Files that share a path prefix share the modules along it, so the tree
+/// merges them: `lib/base.simf` and `lib/left.simf` both live under one
+/// `mod lib`. Children keep the order they were inserted in, which is the
+/// driver's topological load order.
+#[derive(Default)]
+struct ModuleTree {
+    /// The items of the file whose path ends exactly here, if any.
+    items: Vec<parse::Item>,
+    /// A file id to attribute this module's span to, for diagnostics.
+    file_id: Option<usize>,
+    children: Vec<(ModuleName, ModuleTree)>,
 }
 
-// TODO: allow enums in deps when mentioned problems are resolved
-/// Enums by design are nominative, therefore to reason about same named enums in different modules
-/// we have to have a stable ABI with the suport of "qualified name".
-/// Currently, there is no support of "qualified name" concpet, therefore at the time of creating
-/// enums, it is forbidden to decler them in dependencies.
-///
-/// If we used current ABI we would face following problems:
-/// 1. Adding or removing an unrelated dependency renumbers the files, so the same enum's ABI
-///    name changes between builds even though no source changed.
-///    The whole point of "identity is the qualified name" is that serialized forms can identify an enum across builds.
-/// 2. Unwritable witness files. A user filling in a witness would have
-///    to write `unit_2::Action::Cold` (a name that appears nowhere in their source and that they can't predict).
-/// 3. Meaningless nominal distinctness. `a::Action` vs `b::Action` being distinct types only makes
-///    sense if a and b are the user's module names, not compiler-generated counters.
-fn forbid_enum_dec_in_deps(
-    source_id: usize,
-    local_items: &[parse::Item],
-    diagnostics: &mut DiagnosticManager,
-) {
-    if source_id == MAIN_MODULE {
-        return;
+impl ModuleTree {
+    /// Place `items` at `path`, creating the modules along the way.
+    fn insert(&mut self, path: &[ModuleName], file_id: usize, items: Vec<parse::Item>) {
+        if self.file_id.is_none() {
+            self.file_id = Some(file_id);
+        }
+
+        let Some((head, rest)) = path.split_first() else {
+            self.items.extend(items);
+            return;
+        };
+
+        match self.children.iter().position(|(name, _)| name == head) {
+            Some(index) => self.children[index].1.insert(rest, file_id, items),
+            None => {
+                let mut child = Self::default();
+                child.insert(rest, file_id, items);
+                self.children.push((head.shallow_clone(), child));
+            }
+        }
     }
 
-    for decl in enum_declarations(local_items) {
+    /// Flatten the tree into items.
+    ///
+    /// Submodules come before the node's own items, so a file's dependencies
+    /// are analyzed before the file that imports them.
+    fn into_items(self) -> Vec<parse::Item> {
+        let file_id = self.file_id.unwrap_or(MAIN_MODULE);
+        let mut out = Vec::with_capacity(self.children.len() + self.items.len());
+
+        for (name, child) in self.children {
+            let inner = child.into_items();
+            out.push(parse::Item::Module(parse::Module::new(
+                file_id,
+                // The module exists so that the items the user imported can
+                // be reached through it; `pub` on the items themselves is
+                // what actually governs access.
+                Visibility::Public,
+                name,
+                &inner,
+            )));
+        }
+
+        out.extend(self.items);
+        out
+    }
+}
+
+/// Reject a module declared in the entry file whose name collides with the
+/// module a dependency's directory contributes at the root.
+///
+/// The entry file's items sit at the root of the flattened program beside
+/// those modules, so the two can collide. The user owns both names here --
+/// the module they wrote and the directory they pointed a dependency at --
+/// so rejecting the collision is actionable.
+fn forbid_root_module_collision(
+    local_items: &[parse::Item],
+    occupied: &HashSet<ModuleName>,
+    diagnostics: &mut DiagnosticManager,
+) {
+    for item in local_items {
+        let parse::Item::Module(module) = item else {
+            continue;
+        };
+
+        if !occupied.contains(module.name()) {
+            continue;
+        }
+
         diagnostics.push(Diagnostic::new(
             Error::Grammar {
                 msg: format!(
-                    "enum `{}` is declared in a dependency file; \
-                     enums may only be declared in the program's own files",
-                    decl.name()
+                    "module `{}` has the same name as the module a dependency of this \
+                     program contributes; rename one of them",
+                    module.name()
                 ),
             },
-            *decl.as_ref(),
+            *module.span(),
         ));
     }
 }
@@ -74,13 +123,181 @@ impl DependencyGraph {
         }
     }
 
+    /// The package root that owns the entry file.
+    ///
+    /// Files under it are part of the program itself; files under any other
+    /// package root belong to a dependency.
+    fn entry_package_root(&self, diagnostics: &mut DiagnosticManager) -> Option<CanonPath> {
+        let entry = self.sources.path(MAIN_MODULE)?;
+        match self.dependency_map.get_package_root(entry) {
+            Some(root) => Some(root.clone()),
+            None => {
+                diagnostics.push(Diagnostic::file(
+                    Error::Internal {
+                        msg: "the entry file is not inside any package root".to_owned(),
+                    },
+                    MAIN_MODULE,
+                ));
+                None
+            }
+        }
+    }
+
+    /// The module path a file's items occupy in the flattened program.
+    ///
+    /// The path is the file's location relative to the root of the package
+    /// that owns it, with the directory name of the package prefixed when the
+    /// file belongs to a dependency. So `libs/lib/A.simf` reached through a
+    /// dependency rooted at `libs/lib` becomes `lib::A`, and `utils/math.simf`
+    /// inside the program itself becomes `utils::math`.
+    ///
+    /// The entry file is not wrapped, so its path is empty.
+    ///
+    /// Every segment is a name the user chose -- a directory or a file stem --
+    /// so it has to be a legal identifier, and a segment that is not is
+    /// reported here rather than producing an unnameable module.
+    fn module_path_of(
+        &self,
+        source_id: usize,
+        entry_root: &CanonPath,
+    ) -> Result<Vec<ModuleName>, Diagnostic> {
+        if source_id == MAIN_MODULE {
+            return Ok(Vec::new());
+        }
+
+        let internal = |msg: String| Diagnostic::file(Error::Internal { msg }, source_id);
+
+        let path = self
+            .sources
+            .path(source_id)
+            .ok_or_else(|| internal(format!("source {source_id} is not registered")))?;
+
+        let package_root = self
+            .dependency_map
+            .get_package_root(path)
+            .ok_or_else(|| internal("file is not inside any package root".to_owned()))?;
+
+        let relative = path
+            .as_path()
+            .strip_prefix(package_root.as_path())
+            .map_err(|_| internal("file is not inside its own package root".to_owned()))?;
+
+        let mut segments: Vec<String> = Vec::new();
+
+        // A dependency is a module of its own, named after its directory.
+        if package_root != entry_root {
+            let name = package_root
+                .as_path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| internal("dependency root has no directory name".to_owned()))?;
+            segments.push(name.to_owned());
+        }
+
+        if let Some(parent) = relative.parent() {
+            for component in parent.iter() {
+                let segment = component
+                    .to_str()
+                    .ok_or_else(|| internal("path component is not valid UTF-8".to_owned()))?;
+                segments.push(segment.to_owned());
+            }
+        }
+
+        let stem = relative
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| internal("file has no stem".to_owned()))?;
+        segments.push(stem.to_owned());
+
+        for segment in &segments {
+            if !is_valid_dependency_identifier(segment) {
+                return Err(Diagnostic::file(
+                    Error::Grammar {
+                        msg: format!(
+                            "`{segment}` is used as a module name but is not a valid \
+                             identifier; rename the file or directory"
+                        ),
+                    },
+                    source_id,
+                ));
+            }
+        }
+
+        Ok(segments
+            .iter()
+            .map(|segment| ModuleName::from_str_unchecked(segment))
+            .collect())
+    }
+
+    /// The module path of every file in `order`, or `None` if any file could
+    /// not be placed. Two files may not occupy the same path.
+    fn module_paths(
+        &self,
+        order: &[usize],
+        entry_root: &CanonPath,
+        diagnostics: &mut DiagnosticManager,
+    ) -> Option<HashMap<usize, Vec<ModuleName>>> {
+        let mut paths = HashMap::with_capacity(order.len());
+        let mut taken: HashMap<Vec<ModuleName>, usize> = HashMap::with_capacity(order.len());
+        let mut failed = false;
+
+        for &source_id in order {
+            let path = match self.module_path_of(source_id, entry_root) {
+                Ok(path) => path,
+                Err(err) => {
+                    diagnostics.push(err);
+                    failed = true;
+                    continue;
+                }
+            };
+
+            if let Some(&other) = taken.get(&path) {
+                let rendered = path
+                    .iter()
+                    .map(ModuleName::as_str)
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let other_file = self
+                    .sources
+                    .entry(other)
+                    .map_or_else(|| "another file".to_owned(), |e| e.str_name());
+
+                diagnostics.push(Diagnostic::file(
+                    Error::Grammar {
+                        msg: format!(
+                            "this file would be the module `{rendered}`, which is already \
+                             occupied by `{other_file}`; rename one of them"
+                        ),
+                    },
+                    source_id,
+                ));
+                failed = true;
+                continue;
+            }
+
+            taken.insert(path.clone(), source_id);
+            paths.insert(source_id, path);
+        }
+
+        (!failed).then_some(paths)
+    }
+
     /// Constructs the unified array of items for the entire multi-program.
     fn assemble_program(
         &self,
         order: &[usize],
         diagnostics: &mut DiagnosticManager,
     ) -> Option<parse::Program> {
-        let mut items = Vec::with_capacity(order.len());
+        let entry_root = self.entry_package_root(diagnostics)?;
+        let module_paths = self.module_paths(order, &entry_root, diagnostics)?;
+
+        // The names a dependency's directory contributes at the root, which
+        // the entry file's own modules must not collide with.
+        let occupied: HashSet<ModuleName> = module_paths
+            .iter()
+            .filter(|(&source_id, _)| source_id != MAIN_MODULE)
+            .filter_map(|(_, path)| path.first().map(ModuleName::shallow_clone))
+            .collect();
 
         let target_ids: HashMap<Span, usize> = self
             .use_cache
@@ -94,6 +311,8 @@ impl DependencyGraph {
             })
             .collect();
 
+        let mut tree = ModuleTree::default();
+
         for &source_id in order {
             let module = &self.modules[&source_id];
 
@@ -101,7 +320,7 @@ impl DependencyGraph {
                 .program
                 .items()
                 .iter()
-                .filter_map(|item| self.rewrite_item(item, &target_ids))
+                .filter_map(|item| self.rewrite_item(item, &target_ids, &module_paths))
                 .collect();
 
             if source_id == MAIN_MODULE {
@@ -114,24 +333,14 @@ impl DependencyGraph {
                         msg: Error::MainOutOfEntryFile.to_string(),
                     }));
                 }
+
+                forbid_root_module_collision(&local_items, &occupied, diagnostics);
             }
 
-            forbid_enum_dec_in_deps(source_id, &local_items, diagnostics);
-
-            // TODO(enums): the flattened output wraps every file — the
-            // entry file included — in a generated module, but enum
-            // declarations are only valid at the top level of a file, so
-            // flattening an enum program produces source that no longer
-            // re-parses (`TemplateAst::flatten`). Splice the entry
-            // file's items at the root instead of wrapping them.
-            let name = ModuleName::from_ident(&Self::get_module_name(source_id));
-            items.push(parse::Item::Module(parse::Module::new(
-                source_id,
-                Visibility::Private,
-                name,
-                &local_items,
-            )));
+            tree.insert(&module_paths[&source_id], source_id, local_items);
         }
+
+        let items = tree.into_items();
 
         (!diagnostics.has_errors())
             .then(|| parse::Program::new(&items, *self.modules[&MAIN_MODULE].program.as_ref()))
@@ -142,14 +351,17 @@ impl DependencyGraph {
         &self,
         item: &parse::Item,
         target_ids: &HashMap<Span, usize>,
+        module_paths: &HashMap<usize, Vec<ModuleName>>,
     ) -> Option<parse::Item> {
         match item {
-            parse::Item::Use(use_decl) => Some(self.rewrite_use(use_decl, target_ids)),
+            parse::Item::Use(use_decl) => {
+                Some(self.rewrite_use(use_decl, target_ids, module_paths))
+            }
             parse::Item::Module(module) => {
                 let items: Vec<parse::Item> = module
                     .items()
                     .iter()
-                    .filter_map(|inner_item| self.rewrite_item(inner_item, target_ids))
+                    .filter_map(|inner_item| self.rewrite_item(inner_item, target_ids, module_paths))
                     .collect();
 
                 Some(parse::Item::Module(parse::Module::new(
@@ -168,33 +380,39 @@ impl DependencyGraph {
 
     /// Rewrites a `use` declaration into its canonical `crate`-rooted form.
     ///
-    /// The resolved path becomes `crate::unit_<N>::<mod_path...>`, where `N` is
-    /// the source id of the file that owns the imported item.
+    /// The resolved path becomes `crate::<module path of the target file>::<mod_path...>`.
+    /// A `use` pointing into the entry file keeps its `mod_path` alone, since
+    /// the entry file's items are not wrapped.
     ///
     /// ## Example
     ///
-    /// - `use base_math::simple_op::hash` → `use crate::unit_2::hash`
+    /// - `use base_math::simple_op::hash` → `use crate::math::simple_op::hash`
+    /// - `use crate::inline_mod::item` → `use crate::inline_mod::item`
     fn rewrite_use(
         &self,
         use_decl: &parse::UseDecl,
         target_ids: &HashMap<Span, usize>,
+        module_paths: &HashMap<usize, Vec<ModuleName>>,
     ) -> parse::Item {
         let span = *use_decl.span();
         let resolved = &self.use_cache[&span];
         let target_id = target_ids[&span];
+        let target_path = module_paths
+            .get(&target_id)
+            .map_or(&[] as &[ModuleName], Vec::as_slice);
 
-        let mut new_path = Vec::with_capacity(resolved.mod_path.len() + 2);
+        let mut new_path = Vec::with_capacity(target_path.len() + resolved.mod_path.len() + 1);
         new_path.push(Identifier::from_str_unchecked(CRATE_STR));
-        new_path.push(Self::get_module_name(target_id));
+        new_path.extend(
+            target_path
+                .iter()
+                .map(|segment| Identifier::from_str_unchecked(segment.as_str())),
+        );
         new_path.extend(resolved.mod_path.iter().cloned());
 
         let mut use_decl = use_decl.clone();
         use_decl.set_path(&new_path);
         parse::Item::Use(use_decl)
-    }
-
-    fn get_module_name(source_id: usize) -> Identifier {
-        Identifier::from_str_unchecked(format!("unit_{}", source_id).as_str())
     }
 }
 
@@ -203,7 +421,7 @@ mod flattening_tests {
     use crate::driver::tests::setup_graph;
     use crate::driver::CRATE_STR;
     use crate::error::{Diagnostic, Error, Location, Span};
-    use crate::parse::{self, Visibility};
+    use crate::parse;
 
     use std::collections::HashMap;
 
@@ -220,92 +438,98 @@ mod flattening_tests {
         (program, ids)
     }
 
+    /// Find a module by name among `items`.
+    fn find_module<'a>(items: &'a [parse::Item], name: &str) -> Option<&'a parse::Module> {
+        items.iter().find_map(|item| match item {
+            parse::Item::Module(m) => (m.name().as_str() == name).then_some(m),
+            _ => None,
+        })
+    }
+
     #[test]
-    fn test_dependency_is_wrapped_in_file_module() {
-        // Scenario: A dependency file MUST be wrapped in a `mod file_N` block,
-        // and its visibility must be Private to prevent leaking.
-        let (program, ids) = build_flattened_program(vec![
+    fn entry_file_items_are_spliced_at_the_root() {
+        // The entry file must not be wrapped: `fn main` stays at the top
+        // level, so flattening is idempotent and types declared there keep
+        // an empty module path.
+        let (program, _ids) = build_flattened_program(vec![
             ("libs/lib/A.simf", "pub fn dep_func() {}"),
             ("main.simf", "use lib::A::dep_func; fn main() {}"),
         ]);
 
-        let file_a_id = ids["A"];
-        let expected_mod_name = format!("unit_{}", file_a_id);
-
-        let wrapped_module = program
+        let has_root_main = program
             .items()
             .iter()
-            .find_map(|item| {
-                if let parse::Item::Module(m) = item {
-                    if *m.name() == *expected_mod_name {
-                        return Some(m);
-                    }
-                }
-                None
-            })
-            .expect("Dependency should be wrapped in a file_N module");
-
+            .any(|item| matches!(item, parse::Item::Function(f) if f.name() == "main"));
         assert!(
-            matches!(wrapped_module.visibility(), Visibility::Private),
-            "The file wrapper module must be strictly private"
+            has_root_main,
+            "`fn main` must live at the root of the flattened program"
         );
+    }
 
-        let has_dep_func = wrapped_module
+    #[test]
+    fn dependency_is_nested_under_its_declared_names() {
+        // A dependency file lands at the module path its directory and file
+        // name spell, not at a compiler-generated name.
+        let (program, _ids) = build_flattened_program(vec![
+            ("libs/lib/A.simf", "pub fn dep_func() {}"),
+            ("main.simf", "use lib::A::dep_func; fn main() {}"),
+        ]);
+
+        let lib = find_module(program.items(), "lib")
+            .expect("the dependency should live under `mod lib`");
+        let file = find_module(lib.items(), "A").expect("its file should live under `mod A`");
+
+        let has_dep_func = file
             .items()
             .iter()
             .any(|item| matches!(item, parse::Item::Function(f) if f.name() == "dep_func"));
+        assert!(has_dep_func, "`mod lib::A` must hold the dependency's items");
+    }
+
+    #[test]
+    fn program_owned_subdirectory_keeps_its_own_path() {
+        // A file belonging to the program itself is not prefixed by a
+        // dependency name: it keeps its path relative to the project root.
+        let (program, _ids) = build_flattened_program(vec![
+            ("utils/math.simf", "pub fn add() {}"),
+            ("main.simf", "use crate::utils::math::add; fn main() {}"),
+        ]);
+
+        let utils =
+            find_module(program.items(), "utils").expect("`utils/` should become `mod utils`");
         assert!(
-            has_dep_func,
-            "The file_N module must contain the dependency's items"
+            find_module(utils.items(), "math").is_some(),
+            "`utils/math.simf` should become `mod utils::math`"
         );
     }
 
     #[test]
     fn test_use_paths_are_rewritten_to_canonical_files() {
-        // Scenario: When main.simf says `use lib::A::foo`, the AST flattener
-        // must rewrite this path to `use crate::file_N::foo`.
-        let (program, ids) = build_flattened_program(vec![
+        // Scenario: When main.simf says `use lib::A::foo`, the flattener must
+        // rewrite this path to `use crate::lib::A::foo`.
+        let (program, _ids) = build_flattened_program(vec![
             ("libs/lib/A.simf", "pub fn foo() {}"),
             ("main.simf", "use lib::A::foo; fn main() {}"),
         ]);
 
-        let file_a_id = ids["A"];
-        let expected_file_segment = format!("unit_{}", file_a_id);
-
-        // Flatten the modules and search their inner contents
+        // The entry file is not wrapped, so its `use` sits at the root.
         let use_decl = program
             .items()
             .iter()
-            .filter_map(|item| {
-                if let parse::Item::Module(module) = item {
-                    Some(module.items()) // Get the slice of inner items
-                } else {
-                    None
-                }
-            })
-            .flatten() // Unpack all the inner slices into a single stream
-            .find_map(|inner_item| {
-                if let parse::Item::Use(u) = inner_item {
+            .find_map(|item| {
+                if let parse::Item::Use(u) = item {
                     Some(u)
                 } else {
                     None
                 }
             })
-            .expect("Main module should contain a use declaration");
+            .expect("The entry file's use declaration should be at the root");
 
-        // Get the segments of the rewritten path
         let path = use_decl.path();
-
-        assert!(
-            path.len() >= 2,
-            "Rewritten path must have at least 2 segments"
-        );
+        assert_eq!(path.len(), 3, "expected `crate::lib::A`, got {path:?}");
         assert_eq!(path[0], *CRATE_STR, "Path must start with `crate`");
-        assert_eq!(
-            path[1],
-            *expected_file_segment.as_str(),
-            "Path must route through the canonical `unit_N`"
-        );
+        assert_eq!(path[1], *"lib", "Path must route through the dependency name");
+        assert_eq!(path[2], *"A", "Path must route through the file name");
     }
 
     #[test]

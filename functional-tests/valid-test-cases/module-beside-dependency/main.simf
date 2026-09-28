@@ -1,0 +1,3 @@
+use lib::module::add;
+mod helper {}
+fn main() {}

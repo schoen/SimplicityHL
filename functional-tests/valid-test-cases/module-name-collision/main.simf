@@ -1,3 +1,0 @@
-use lib::module::add;
-mod unit_1 {}
-fn main() {}

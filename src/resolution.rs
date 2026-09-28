@@ -19,7 +19,7 @@ pub(crate) struct Remapping {
     pub(crate) target: CanonPath,
 }
 
-fn is_valid_dependency_identifier(s: &str) -> bool {
+pub(crate) fn is_valid_dependency_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
