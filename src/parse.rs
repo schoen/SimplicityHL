@@ -1176,6 +1176,12 @@ pub struct Module {
     visibility: Visibility,
     name: ModuleName,
     items: Arc<[Item]>,
+    /// `true` for `mod name;`, which declares the module and says its
+    /// contents live in `name.simf`. The driver loads that file and replaces
+    /// the declaration with the module it spells out, so a module written
+    /// `mod name { ... }` and one loaded from a file are the same thing by
+    /// the time the analyzer sees either.
+    from_file: bool,
     span: Span,
 }
 
@@ -1196,8 +1202,15 @@ impl Module {
             visibility,
             name,
             items: Arc::from(items),
+            from_file: false,
             span: Span::new(file_id, 0..0),
         }
+    }
+
+    /// Whether this is a `mod name;` declaration whose contents the driver
+    /// still has to load from `name.simf`.
+    pub fn is_from_file(&self) -> bool {
+        self.from_file
     }
 
     pub fn visibility(&self) -> &Visibility {
@@ -1337,6 +1350,10 @@ impl fmt::Display for UseItems {
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_from_file() {
+            return write!(f, "{}mod {};", self.visibility(), self.name());
+        }
+
         writeln!(f, "{}mod {} {{", self.visibility(), self.name())?;
 
         for item in self.items() {
@@ -3164,12 +3181,20 @@ impl Module {
             )))
             .map(Arc::from);
 
+        // `mod name { ... }` spells the module out; `mod name;` declares it
+        // and leaves the contents to the file of that name.
+        let body = items
+            .map(Some)
+            .or(just(Token::Semi).to(None))
+            .labelled("module body or `;`");
+
         visibility
-            .then(just(Token::Mod).ignore_then(name).then(items))
+            .then(just(Token::Mod).ignore_then(name).then(body))
             .map_with(|(visibility, (name, items)), e| Self {
                 visibility,
                 name: name.0,
-                items,
+                from_file: items.is_none(),
+                items: items.unwrap_or_else(|| Arc::from([])),
                 span: e.span(),
             })
     }
@@ -3378,6 +3403,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Module {
             visibility,
             name,
             items: items_vec.into(),
+            from_file: false,
             span: Span::DUMMY,
         })
     }

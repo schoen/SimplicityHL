@@ -40,6 +40,7 @@ use crate::error::{Diagnostic, DiagnosticManager, Error, Span};
 use crate::parse::{self, ParseFromStrWithErrors};
 use crate::resolution::{DependencyMap, ResolvedUse};
 use crate::source::{CanonPath, CanonSourceFile};
+use crate::str::ModuleName;
 use crate::unstable::UnstableFeatures;
 
 /// The reserved identifier for the program's entry point.
@@ -173,6 +174,14 @@ pub(crate) struct DependencyGraph {
     /// Example: If `main.simf` (ID: 0) has `use lib::math;` (ID: 1) and `use lib::io;` (ID: 2),
     /// this map will contain: `{ 0: [1, 2] }`.
     dependencies: HashMap<usize, Vec<usize>>,
+
+    /// For a file brought in by a `mod name;` declaration: the file that
+    /// declared it and the name it was given there.
+    ///
+    /// A file's position in the module tree is the chain of these names up to
+    /// the entry file. A file reached only by `use` has no entry here, and its
+    /// position is derived from where it sits on disk instead.
+    declared_parents: HashMap<usize, (usize, ModuleName)>,
 }
 
 impl DependencyGraph {
@@ -247,6 +256,7 @@ impl DependencyGraph {
             sources,
             use_cache: HashMap::new(),
             dependencies: HashMap::new(),
+            declared_parents: HashMap::new(),
         };
 
         graph.discover_dependencies(&mut diagnostics, unstable_features);
@@ -305,6 +315,12 @@ impl DependencyGraph {
                 diagnostics,
             );
 
+            let declared = Self::resolve_module_declarations(
+                &current_source_module.program,
+                &current,
+                diagnostics,
+            );
+
             let mut ctx = LoadContext {
                 invalid_imports: &mut invalid_imports,
                 diagnostics,
@@ -312,6 +328,7 @@ impl DependencyGraph {
                 unstable_features,
             };
             self.load_and_parse_dependencies(&current, valid_imports, &mut ctx);
+            self.load_declared_modules(&current, declared, &mut ctx);
         }
 
         self.use_cache = use_cache;
@@ -409,6 +426,170 @@ impl DependencyGraph {
                 .or_default()
                 .push(new_id);
             ctx.queue.push_back(new_id);
+        }
+    }
+
+    /// Resolve the `mod name;` declarations of one file to the files they name.
+    ///
+    /// `mod name;` says the module's contents live in `name.simf`, resolved
+    /// relative to the directory of the file that declares it. Unlike `use`,
+    /// which names something that already exists somewhere, this is what
+    /// brings a file into the program and fixes where it sits in the module
+    /// tree.
+    ///
+    /// Only the top level of a file may declare one, so that a declared
+    /// module's position is the chain of names up to the entry file and
+    /// nothing else.
+    fn resolve_module_declarations(
+        current_program: &parse::Program,
+        current_module: &CurrentModule,
+        diagnostics: &mut DiagnosticManager,
+    ) -> Vec<(ModuleName, CanonPath, Span)> {
+        Self::reject_nested_module_declarations(current_program.items(), diagnostics);
+
+        let Some(directory) = current_module.source.name().as_path().parent() else {
+            return Vec::new();
+        };
+
+        let mut declared = Vec::new();
+        for item in current_program.items() {
+            let parse::Item::Module(module) = item else {
+                continue;
+            };
+            if !module.is_from_file() {
+                continue;
+            }
+
+            let span = *module.span();
+            let candidate = directory.join(module.name().as_str()).with_extension("simf");
+
+            match CanonPath::canonicalize(&candidate) {
+                Ok(path) => declared.push((module.name().shallow_clone(), path, span)),
+                Err(_) => diagnostics.push(Diagnostic::new(
+                    Error::FileNotFound {
+                        filename: candidate,
+                    },
+                    span,
+                )),
+            }
+        }
+        declared
+    }
+
+    /// A `mod name;` inside a `mod name { ... }` block would give the declared
+    /// module a position that is partly written and partly inherited, so it is
+    /// rejected while the two are still being unified.
+    fn reject_nested_module_declarations(
+        items: &[parse::Item],
+        diagnostics: &mut DiagnosticManager,
+    ) {
+        for item in items {
+            let parse::Item::Module(module) = item else {
+                continue;
+            };
+
+            if module.is_from_file() {
+                continue;
+            }
+
+            for inner in module.items() {
+                if let parse::Item::Module(inner_module) = inner {
+                    if inner_module.is_from_file() {
+                        diagnostics.push(Diagnostic::new(
+                            Error::Grammar {
+                                msg: format!(
+                                    "`mod {};` is declared inside `mod {}`; a module whose \
+                                     contents come from a file must be declared at the top \
+                                     level of a file",
+                                    inner_module.name(),
+                                    module.name()
+                                ),
+                            },
+                            *inner_module.span(),
+                        ));
+                    }
+                }
+            }
+
+            Self::reject_nested_module_declarations(module.items(), diagnostics);
+        }
+    }
+
+    /// Load the files named by one file's `mod name;` declarations, recording
+    /// where each one sits in the module tree.
+    fn load_declared_modules(
+        &mut self,
+        current: &CurrentModule,
+        declared: Vec<(ModuleName, CanonPath, Span)>,
+        ctx: &mut LoadContext,
+    ) {
+        for (name, path, span) in declared {
+            let existing = self.sources.id(&path);
+
+            let child_id = match existing {
+                Some(id) => id,
+                None => {
+                    let Ok(content) = std::fs::read_to_string(path.as_path()) else {
+                        ctx.diagnostics.push(Diagnostic::new(
+                            Error::FileNotFound {
+                                filename: PathBuf::from(path.as_path()),
+                            },
+                            span,
+                        ));
+                        continue;
+                    };
+
+                    let source = CanonSourceFile::new(path.clone(), Arc::from(content));
+                    let new_id = self.sources.len();
+                    self.sources.insert(source.clone());
+
+                    let Some(parsed_program) = Self::parse_and_get_source_module(
+                        new_id,
+                        &source.content(),
+                        ctx.diagnostics,
+                        ctx.unstable_features,
+                    ) else {
+                        continue;
+                    };
+
+                    self.modules.insert(
+                        new_id,
+                        SourceModule {
+                            source,
+                            program: parsed_program,
+                        },
+                    );
+                    ctx.queue.push_back(new_id);
+                    new_id
+                }
+            };
+
+            if let Some((other, _)) = self.declared_parents.get(&child_id) {
+                let other_name = self
+                    .sources
+                    .entry(*other)
+                    .map_or_else(|| "another file".to_owned(), CanonSourceFile::str_name);
+
+                ctx.diagnostics.push(Diagnostic::new(
+                    Error::Grammar {
+                        msg: format!(
+                            "this file is already declared as a module by `{other_name}`; a \
+                             file may occupy only one position in the module tree"
+                        ),
+                    },
+                    span,
+                ));
+                continue;
+            }
+
+            self.declared_parents.insert(child_id, (current.id, name));
+
+            // The declared module's items are emitted inside the declaring
+            // file's module, so it must be loaded first.
+            let deps = self.dependencies.entry(current.id).or_default();
+            if !deps.contains(&child_id) {
+                deps.push(child_id);
+            }
         }
     }
 

@@ -1670,6 +1670,16 @@ impl AbstractSyntaxTree for Item {
 
                 Ok(Self::EnumDeclaration)
             }
+            parse::Item::Module(module) if module.is_from_file() => {
+                Err(Error::Grammar {
+                    msg: format!(
+                        "the contents of `mod {};` were not loaded; a module declared from \
+                         a file needs the program to be compiled from files",
+                        module.name()
+                    ),
+                })
+                .with_span(module)?
+            }
             parse::Item::Module(module) => scope
                 .in_module(
                     module.name().clone(),

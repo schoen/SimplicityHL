@@ -1681,6 +1681,78 @@ fn main() {
             .assert_run_success();
     }
 
+    /// A witness file names a nested enum by the qualified path the ABI
+    /// prints, and resolution constructs the value at that type.
+    ///
+    /// This round trip was impossible while modules were named by the
+    /// compiler: the qualified name would have been `unit_0::keys::Action`,
+    /// which appears nowhere in the user's source.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn witness_file_names_a_nested_enum_by_its_qualified_path() {
+        let src = "mod keys {
+                 pub enum Action { Hot, Cold, }
+             }
+             use crate::keys::Action;
+             fn main() {
+                 let x: u32 = match witness::ACT {
+                     Action::Hot => 1,
+                     Action::Cold => 2,
+                 };
+                 assert!(jet::eq_32(x, 2));
+             }";
+        let compiled = CompiledProgram::new_with_unstable(
+            src,
+            &UnstableFeatures::all(),
+            Arguments::default(),
+            false,
+            Box::new(ElementsJetHinter::new()),
+        )
+        .unwrap();
+
+        let unresolved: UnresolvedValues =
+            serde_json::from_str(r#"{ "ACT": "keys::Action::Cold" }"#).unwrap();
+        let witness: WitnessValues = unresolved.resolve(compiled.witness_types()).unwrap();
+        assert!(witness
+            .get(&TemplateProgramWitness::witness_from_str("ACT"))
+            .is_some());
+
+        TestCase::program_text_with_unstable(Cow::Borrowed(src), UnstableFeatures::all())
+            .with_witness_values(witness)
+            .assert_run_success();
+    }
+
+    /// The bare name of a nested enum is not its identity, so a witness file
+    /// may not name it that way.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn witness_file_rejects_a_nested_enum_named_without_its_module() {
+        let src = "mod keys {
+                 pub enum Action { Hot, Cold, }
+             }
+             use crate::keys::Action;
+             fn main() {
+                 let x: u32 = match witness::ACT {
+                     Action::Hot => 1,
+                     Action::Cold => 2,
+                 };
+                 assert!(jet::eq_32(x, 2));
+             }";
+        let compiled = CompiledProgram::new_with_unstable(
+            src,
+            &UnstableFeatures::all(),
+            Arguments::default(),
+            false,
+            Box::new(ElementsJetHinter::new()),
+        )
+        .unwrap();
+
+        let unresolved: UnresolvedValues =
+            serde_json::from_str(r#"{ "ACT": "Action::Cold" }"#).unwrap();
+        let resolved: Result<WitnessValues, String> = unresolved.resolve(compiled.witness_types());
+        resolved.expect_err("`Action` alone does not name `keys::Action`");
+    }
+
     #[test]
     fn strict_satisfy_rejects_missing_witness() {
         use crate::value::ValueConstructible;
@@ -1919,6 +1991,17 @@ mod functional_tests {
         run_dependency_test(format!("{}/module-simple", VALID_TESTS_DIR).as_str(), "lib");
     }
 
+    /// `mod helper;` declares the module and names the file its contents come
+    /// from, so the module tree is written rather than inferred from the
+    /// directory layout.
+    #[test]
+    fn declared_module() {
+        run_multidep_test(
+            format!("{}/declared-module", VALID_TESTS_DIR).as_str(),
+            &[],
+        );
+    }
+
     /// A module declared in the entry file sits beside the modules generated
     /// for dependencies, so the two must coexist without interfering.
     #[test]
@@ -2090,6 +2173,47 @@ mod functional_tests {
         run_multidep_test(
             format!("{}/local-file-as-external", ERROR_TESTS_DIR).as_str(),
             &[(".", "ext", ".")],
+        );
+    }
+
+    /// Flattening a multi-file program yields a single file that compiles to
+    /// the same Simplicity program, and flattening that file again changes
+    /// nothing.
+    ///
+    /// Neither held while the entry file was wrapped in a generated module:
+    /// `fn main` ended up inside it, so the output did not re-parse as a
+    /// program at all.
+    #[test]
+    fn flattening_is_idempotent_and_preserves_the_program() {
+        use crate::test_utils::TempWorkspace;
+        use crate::tests::{build_dependency_map, flatten_template_file, MAIN};
+
+        let root = PathBuf::from("./examples/single_dep");
+        let main_path = root.join(MAIN);
+        let dep_path = root.join("temp");
+        let dependency_map = build_dependency_map(&main_path, [(&root, "temp", &dep_path)]);
+
+        let multi_file = compile_with_deps(&main_path, &dependency_map);
+        let flattened = flatten_template_file(&main_path, &dependency_map);
+
+        // The flattened program stands alone, with no dependencies to resolve.
+        let workspace = TempWorkspace::new("flatten-idempotent");
+        let flat_main = workspace.create_file("main.simf", &flattened);
+        let flat_root = CanonPath::canonicalize(flat_main.parent().unwrap())
+            .expect("the temporary workspace exists");
+        let no_dependencies = build_map(&flat_root, &[]).unwrap();
+
+        let from_flattened = compile_with_deps(&flat_main, &no_dependencies);
+        assert_eq!(
+            multi_file.commit().cmr(),
+            from_flattened.commit().cmr(),
+            "the flattened program must compile to the same Simplicity program"
+        );
+
+        let flattened_twice = flatten_template_file(&flat_main, &no_dependencies);
+        assert_eq!(
+            flattened, flattened_twice,
+            "flattening an already flattened program must change nothing"
         );
     }
 

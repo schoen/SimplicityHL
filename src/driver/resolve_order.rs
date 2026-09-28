@@ -161,6 +161,30 @@ impl DependencyGraph {
         source_id: usize,
         entry_root: &CanonPath,
     ) -> Result<Vec<ModuleName>, Diagnostic> {
+        // Walk up the chain of `mod name;` declarations. Each one was written
+        // by hand, so it settles where the file sits.
+        let mut declared = Vec::new();
+        let mut current = source_id;
+        while let Some((parent, name)) = self.declared_parents.get(&current) {
+            declared.push(name.shallow_clone());
+            current = *parent;
+        }
+        declared.reverse();
+
+        // The file the chain ends at has no declared position: it is the entry
+        // file, or one a `use` brought in. Its own position is derived.
+        let mut path = self.derived_module_path(current, entry_root)?;
+        path.extend(declared);
+        Ok(path)
+    }
+
+    /// The module path a file's items occupy when nothing declares it, derived
+    /// from where the file sits on disk.
+    fn derived_module_path(
+        &self,
+        source_id: usize,
+        entry_root: &CanonPath,
+    ) -> Result<Vec<ModuleName>, Diagnostic> {
         if source_id == MAIN_MODULE {
             return Ok(Vec::new());
         }
@@ -357,6 +381,10 @@ impl DependencyGraph {
             parse::Item::Use(use_decl) => {
                 Some(self.rewrite_use(use_decl, target_ids, module_paths))
             }
+            // The tree places the declared file's items at this position, so
+            // the declaration itself would be a second, empty module of the
+            // same name.
+            parse::Item::Module(module) if module.is_from_file() => None,
             parse::Item::Module(module) => {
                 let items: Vec<parse::Item> = module
                     .items()
@@ -500,6 +528,72 @@ mod flattening_tests {
         assert!(
             find_module(utils.items(), "math").is_some(),
             "`utils/math.simf` should become `mod utils::math`"
+        );
+    }
+
+    #[test]
+    fn a_module_declaration_brings_in_a_file_no_use_mentions() {
+        // `use` cannot reach this file: nothing imports from it. Only the
+        // declaration brings it into the program.
+        let (program, _ids) = build_flattened_program(vec![
+            ("extra.simf", "pub fn unused_here() {}"),
+            ("main.simf", "mod extra; fn main() {}"),
+        ]);
+
+        let extra =
+            find_module(program.items(), "extra").expect("`mod extra;` must load `extra.simf`");
+        assert!(
+            extra
+                .items()
+                .iter()
+                .any(|item| matches!(item, parse::Item::Function(f) if f.name() == "unused_here")),
+            "the declared module must hold the file's items"
+        );
+    }
+
+    #[test]
+    fn a_module_declaration_does_not_survive_beside_what_it_declared() {
+        let (program, _ids) = build_flattened_program(vec![
+            ("helper.simf", "pub fn add() {}"),
+            ("main.simf", "mod helper; use crate::helper::add; fn main() {}"),
+        ]);
+
+        let named_helper = program
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(item, parse::Item::Module(m) if m.name().as_str() == "helper")
+            })
+            .count();
+        assert_eq!(
+            named_helper, 1,
+            "the declaration must be replaced by the module, not sit beside it"
+        );
+    }
+
+    #[test]
+    fn a_module_declaration_inside_a_module_is_rejected() {
+        let (graph, _ids, _ws, diagnostics) = crate::driver::tests::setup_graph_raw(vec![
+            ("helper.simf", "pub fn add() {}"),
+            ("main.simf", "mod outer { mod helper; } fn main() {}"),
+        ]);
+
+        assert!(graph.is_none(), "a nested module declaration must fail");
+        assert!(
+            diagnostics.render_to_string().contains("top level of a file"),
+            "the error should say where a module declaration may appear: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn a_module_declaration_naming_no_file_is_rejected() {
+        let (graph, _ids, _ws, diagnostics) =
+            crate::driver::tests::setup_graph_raw(vec![("main.simf", "mod missing; fn main() {}")]);
+
+        assert!(graph.is_none(), "a declaration with no file must fail");
+        assert!(
+            diagnostics.render_to_string().contains("missing.simf"),
+            "the error should name the file it looked for: {diagnostics}"
         );
     }
 

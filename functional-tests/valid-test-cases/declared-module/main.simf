@@ -1,0 +1,7 @@
+mod helper;
+
+use crate::helper::add;
+
+fn main() {
+    assert!(jet::eq_32(add(2, 3), 5));
+}
