@@ -386,23 +386,119 @@ impl CompiledProgram {
     }
 }
 
-/// ABI metadata of a program: the types of its witnesses and parameters.
+/// ABI metadata of a program: the types of its witnesses and parameters,
+/// together with the definition of every enum those types mention.
 ///
-/// The in-memory form is complete: enum-typed entries carry their full
-/// [`types::EnumInfo`] definition, including variants, payload types, and
-/// declaration order (which determines the wire encoding).
+/// Both the in-memory and the serialized form are self-contained. An enum
+/// names itself by its declaring module path, and `enum_types` carries each
+/// one's variants in declaration order with their payload types, so a
+/// consumer holding only the JSON can enumerate variants, encode and validate
+/// enum witness values, and notice a variant reordering, which changes the
+/// wire encoding and the CMR without changing any name.
 ///
-/// The serialized JSON form is **not self-contained for enums**: an enum
-/// type serializes as its declared name only. A consumer holding just the
-/// JSON ABI cannot enumerate an enum's variants, validate or encode enum
-/// witness values, or detect a variant reordering (which changes the wire
-/// encoding and the CMR while leaving the ABI text identical). Such
-/// consumers need the program source or another artifact carrying the enum
-/// schema.
+/// The traversal that collects those definitions follows variant payloads, so
+/// an enum reachable only through another enum's variant is included too.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbiMeta {
     pub witness_types: WitnessTypes,
     pub param_types: Parameters,
+}
+
+impl AbiMeta {
+    /// Every enum type this ABI's types mention, keyed by qualified name.
+    ///
+    /// The walk follows variant payloads, so an enum reachable only through
+    /// another enum's variant is included. Sorted by name, so the ABI of a
+    /// given program renders identically every time.
+    pub fn enum_definitions(&self) -> std::collections::BTreeMap<String, types::EnumInfo> {
+        use miniscript::iter::TreeLike as _;
+
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending: Vec<types::ResolvedType> = self
+            .witness_types
+            .iter()
+            .chain(self.param_types.iter())
+            .map(|(_, ty)| ty.clone())
+            .collect();
+
+        while let Some(ty) = pending.pop() {
+            for data in (&ty).post_order_iter() {
+                let Some(info) = data.node.as_enum() else {
+                    continue;
+                };
+
+                // Only walk into a definition the first time it is seen: an
+                // enum whose variant mentions itself would not terminate.
+                if found.insert(info.qualified_name(), info.clone()).is_none() {
+                    for variant in info.variants() {
+                        pending.extend(variant.payload().iter().cloned());
+                    }
+                }
+            }
+        }
+
+        found
+    }
+}
+
+impl core::fmt::Display for AbiMeta {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fn write_types(
+            f: &mut core::fmt::Formatter<'_>,
+            label: &str,
+            types: impl Iterator<Item = (String, String)>,
+        ) -> core::fmt::Result {
+            let mut sorted: Vec<(String, String)> = types.collect();
+            sorted.sort();
+
+            writeln!(f, "{label}:")?;
+            if sorted.is_empty() {
+                return writeln!(f, "  (none)");
+            }
+            for (name, ty) in sorted {
+                writeln!(f, "  {name}: {ty}")?;
+            }
+            Ok(())
+        }
+
+        write_types(
+            f,
+            "witnesses",
+            self.witness_types
+                .iter()
+                .map(|(name, ty)| (name.as_str().to_owned(), ty.to_string())),
+        )?;
+        write_types(
+            f,
+            "parameters",
+            self.param_types
+                .iter()
+                .map(|(name, ty)| (name.as_str().to_owned(), ty.to_string())),
+        )?;
+
+        let enums = self.enum_definitions();
+        writeln!(f, "enums:")?;
+        if enums.is_empty() {
+            return writeln!(f, "  (none)");
+        }
+        for (name, info) in &enums {
+            let variants: Vec<String> = info
+                .variants()
+                .iter()
+                .map(|variant| {
+                    if variant.payload().is_empty() {
+                        variant.name().as_str().to_owned()
+                    } else {
+                        let payload: Vec<String> =
+                            variant.payload().iter().map(ToString::to_string).collect();
+                        format!("{}({})", variant.name(), payload.join(", "))
+                    }
+                })
+                .collect();
+            writeln!(f, "  {name} = {}", variants.join(" | "))?;
+        }
+        Ok(())
+    }
 }
 
 /// A SimplicityHL program, compiled to Simplicity and satisfied with witness data.

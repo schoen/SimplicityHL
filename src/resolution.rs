@@ -241,6 +241,26 @@ pub(crate) struct ResolvedUse {
 }
 
 impl DependencyMap {
+    /// The distinct aliases a dependency directory is bound under, sorted.
+    ///
+    /// The alias is not a dependency's identity: the same directory may be
+    /// bound under different names by different importers. It is only a
+    /// fallback for naming the module a dependency contributes when the
+    /// directory's own name cannot be used, which is why more than one is
+    /// reported rather than one being picked.
+    pub(crate) fn aliases_for_target(&self, target: &CanonPath) -> Vec<&str> {
+        let mut aliases: Vec<&str> = self
+            .remappings
+            .iter()
+            .filter(|remapping| &remapping.target == target)
+            .map(|remapping| remapping.drp_name.as_str())
+            .collect();
+
+        aliases.sort_unstable();
+        aliases.dedup();
+        aliases
+    }
+
     /// Returns the package root for the given file, which corresponds to the
     /// target directory of the most specific dependency or the entry root.
     pub fn get_package_root(&self, current_file: &CanonPath) -> Option<&CanonPath> {

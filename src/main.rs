@@ -38,8 +38,8 @@ impl fmt::Display for Output {
         if let Some(witness) = &self.witness {
             writeln!(f, "Witness:\n{}", witness)?;
         }
-        if let Some(witness) = &self.abi_meta {
-            writeln!(f, "ABI meta:\n{:?}", witness)?;
+        if let Some(abi_meta) = &self.abi_meta {
+            writeln!(f, "ABI meta:\n{}", abi_meta)?;
         }
         Ok(())
     }

@@ -208,14 +208,41 @@ impl DependencyGraph {
 
         let mut segments: Vec<String> = Vec::new();
 
-        // A dependency is a module of its own, named after its directory.
+        // A dependency is a module of its own, named after its directory. When
+        // the directory's name cannot be a module name, the alias it was bound
+        // under stands in: both are placeholders until a dependency declares a
+        // name of its own, and the alias at least appears in the build.
         if package_root != entry_root {
-            let name = package_root
+            let directory = package_root
                 .as_path()
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .ok_or_else(|| internal("dependency root has no directory name".to_owned()))?;
-            segments.push(name.to_owned());
+
+            if is_valid_dependency_identifier(directory) {
+                segments.push(directory.to_owned());
+            } else {
+                let aliases = self.dependency_map.aliases_for_target(package_root);
+                let [alias] = aliases.as_slice() else {
+                    let listed = if aliases.is_empty() {
+                        "and it is bound under no alias".to_owned()
+                    } else {
+                        format!("and it is bound under several aliases ({})", aliases.join(", "))
+                    };
+                    return Err(Diagnostic::file(
+                        Error::Grammar {
+                            msg: format!(
+                                "the dependency directory `{}` cannot be a module name \
+                                 {listed}, so this file has no name; rename the directory \
+                                 to a valid identifier",
+                                package_root.as_path().display()
+                            ),
+                        },
+                        source_id,
+                    ));
+                };
+                segments.push((*alias).to_owned());
+            }
         }
 
         if let Some(parent) = relative.parent() {
@@ -238,8 +265,10 @@ impl DependencyGraph {
                 return Err(Diagnostic::file(
                     Error::Grammar {
                         msg: format!(
-                            "`{segment}` is used as a module name but is not a valid \
-                             identifier; rename the file or directory"
+                            "`{segment}` names a module, because `{}` becomes one, but it is \
+                             not a valid identifier; rename it to ASCII letters, digits and \
+                             underscores, not starting with a digit and not a keyword",
+                            path.as_path().display()
                         ),
                     },
                     source_id,
@@ -290,7 +319,8 @@ impl DependencyGraph {
                     Error::Grammar {
                         msg: format!(
                             "this file would be the module `{rendered}`, which is already \
-                             occupied by `{other_file}`; rename one of them"
+                             occupied by `{other_file}`; rename one of them, or give the two \
+                             dependencies directories with different names"
                         ),
                     },
                     source_id,

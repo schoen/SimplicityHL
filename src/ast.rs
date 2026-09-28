@@ -1310,6 +1310,109 @@ impl Scope {
     /// ## Errors
     ///
     /// * [`Error::UndefinedAlias`]: The alias is not defined in the current scope.
+    /// Walk `modules` down from `scope` and return the type `alias` names there.
+    ///
+    /// A path reaches past the point where a `use` would have had its
+    /// visibility checked, so the check happens here instead, under the same
+    /// rule `resolve_use` applies: a private module is visible to whatever
+    /// contains it, so it may appear as the first segment and no deeper. A
+    /// private type is visible only inside the module that declares it, which
+    /// is the case where there are no segments to cross at all.
+    fn lookup_alias_in(
+        mut scope: &ModuleScope,
+        modules: &[Identifier],
+        alias: &AliasName,
+    ) -> Result<ResolvedType, Error> {
+        for (index, segment) in modules.iter().enumerate() {
+            let name = ModuleName::from_ident(segment);
+            let (inner, visibility) = scope
+                .submodules
+                .get(&name)
+                .ok_or_else(|| Error::ModuleNotFound { name: name.clone() })?;
+
+            if matches!(visibility, Visibility::Private) && index > 0 {
+                return Err(Error::ModuleIsPrivate { name });
+            }
+
+            scope = inner;
+        }
+
+        let (ty, visibility) = scope
+            .aliases
+            .get(alias)
+            .ok_or_else(|| Error::UndefinedAlias {
+                name: alias.clone(),
+            })?;
+
+        if matches!(visibility, Visibility::Private) && !modules.is_empty() {
+            return Err(Error::PrivateItem {
+                name: alias.as_str().to_owned(),
+            });
+        }
+
+        Ok(ty.clone())
+    }
+
+    /// Resolve a path such as `keys::kind::Kind` to the type it names.
+    ///
+    /// `crate` is a keyword that only `use` accepts, so a path written in an
+    /// expression is relative: it resolves against the current module first,
+    /// then against the root, so a path in a nested module can still name
+    /// something in another subtree. A leading `crate` is accepted and skipped
+    /// in case one ever reaches here.
+    ///
+    /// ## Errors
+    ///
+    /// * [`Error::ModuleNotFound`] A segment does not name a module.
+    /// * [`Error::ModuleIsPrivate`] A module on the path is not `pub`.
+    /// * [`Error::PrivateItem`] The type is not `pub`.
+    /// * [`Error::UndefinedAlias`] The last segment does not name a type.
+    fn get_alias_at_path(&self, path: &[Identifier]) -> Result<ResolvedType, Error> {
+        let path = match path.split_first() {
+            Some((first, rest)) if first.as_str() == CRATE_STR => rest,
+            _ => path,
+        };
+
+        let Some((last, modules)) = path.split_last() else {
+            return Err(Error::Grammar {
+                msg: "a path must name a type".to_owned(),
+            });
+        };
+        let alias = AliasName::from_ident(last);
+
+        let here = Self::lookup_alias_in(self.current_module(), modules, &alias);
+        let from_root = Self::lookup_alias_in(&self.root, modules, &alias);
+
+        match (here, from_root) {
+            // Both resolve and disagree: preferring one silently would hide the
+            // other, and no syntax can name it, since `crate` is not writable
+            // in expression position. Say so instead.
+            (Ok(here), Ok(from_root)) if here != from_root => Err(Error::Grammar {
+                msg: format!(
+                    "`{}` names `{here}` here and `{from_root}` from the root of the \
+                     program; rename one of them",
+                    path.iter()
+                        .map(Identifier::as_str)
+                        .collect::<Vec<_>>()
+                        .join("::")
+                ),
+            }),
+            (Ok(ty), _) | (Err(_), Ok(ty)) => Ok(ty),
+            // Report the relative failure: a path is written relative to where
+            // it stands, so that is the one the author meant.
+            (Err(relative), Err(_)) => Err(relative),
+        }
+    }
+
+    /// Whether this scope carries no declarations at all, which is how value
+    /// files (witness and argument) are analyzed: there is nothing to resolve
+    /// a name against, so an enum is named by its own qualified name instead.
+    fn is_scopeless(&self) -> bool {
+        self.root.aliases.is_empty()
+            && self.root.functions.is_empty()
+            && self.root.submodules.is_empty()
+    }
+
     fn get_alias(&self, name: &AliasName) -> Result<ResolvedType, Error> {
         self.current_module()
             .aliases
@@ -1848,27 +1951,33 @@ fn analyze_enum_construction(
         return Err(Error::ExpressionUnexpectedType { ty: ty.clone() }).with_span(span)?;
     };
 
-    // The written name must be the expected enum's.
-    // Enums are declared at the top level, so only a single identifier can name one.
-    // An alias in scope must resolve to the expected type.
-    // Without a scope (witness and argument files) the declared name itself matches.
+    // The written name must name the expected enum: a single identifier
+    // resolves as an alias in scope, and a longer path walks the module tree
+    // from `crate`. Value files (witness and argument) parse without a scope,
+    // so there the enum's own qualified name matches instead.
     let written = construction.enum_path_string();
-    let names_expected_enum = match construction.enum_path() {
-        [single] => {
-            let alias = AliasName::from_ident(single);
-            match scope.get_alias(&alias) {
-                Ok(resolved) if &resolved == ty => true,
-                Ok(resolved) => Err(Error::ExpressionTypeMismatch {
-                    expected: ty.clone(),
-                    found: resolved,
-                })
-                .with_span(span)?,
-                Err(_) => scope.unscoped_enum_names && written == info.qualified_name(),
-            }
-        }
-        // Value files (witness and argument) name a nested enum by its
-        // qualified path, which has more than one segment.
-        _ => scope.unscoped_enum_names && written == info.qualified_name(),
+    debug_assert!(
+        !scope.unscoped_enum_names || scope.is_scopeless(),
+        "unscoped enum names are for value files, which carry no declarations"
+    );
+    let resolved = match construction.enum_path() {
+        _ if scope.unscoped_enum_names => None,
+        [single] => Some(scope.get_alias(&AliasName::from_ident(single))),
+        path => Some(scope.get_alias_at_path(path)),
+    };
+
+    let names_expected_enum = match resolved {
+        None => written == info.qualified_name(),
+        Some(Ok(resolved)) if &resolved == ty => true,
+        Some(Ok(resolved)) => Err(Error::ExpressionTypeMismatch {
+            expected: ty.clone(),
+            found: resolved,
+        })
+        .with_span(span)?,
+        // A single identifier that resolves to nothing falls through to the
+        // "does not name" error below, which says what was expected.
+        Some(Err(_)) if construction.enum_path().len() == 1 => false,
+        Some(Err(err)) => Err(err).with_span(span)?,
     };
     if !names_expected_enum {
         Err(Error::Grammar {
@@ -2206,19 +2315,11 @@ impl AbstractSyntaxTree for EnumMatch {
         debug_assert!(!arms.is_empty(), "the parser rejects empty enum matches");
 
         let enum_name = arms[0].enum_path_string();
-        let [single] = arms[0].enum_path() else {
-            return Err(Error::Grammar {
-                msg: format!(
-                    "`{enum_name}` does not name an enum; match arms name an enum \
-                     by a single identifier that is in scope, so import it with \
-                     `use` if it is declared in another module"
-                ),
-            })
-            .with_span(span)
-            .map_err(Failure::from);
-        };
-        let alias = AliasName::from_ident(single);
-        let enum_ty = scope.get_alias(&alias).with_span(span)?;
+        let enum_ty = match arms[0].enum_path() {
+            [single] => scope.get_alias(&AliasName::from_ident(single)),
+            path => scope.get_alias_at_path(path),
+        }
+        .with_span(span)?;
         let info = match enum_ty.as_enum() {
             Some(info) => info.clone(),
             None => Err(Error::Grammar {
@@ -2235,8 +2336,16 @@ impl AbstractSyntaxTree for EnumMatch {
         let mut arms_by_index: Vec<Option<&parse::EnumMatchArm>> =
             vec![None; info.variants().len()];
 
-        scope.analyze_all(arms, |arm, _scope| {
-            if arm.enum_path() != arms[0].enum_path() {
+        scope.analyze_all(arms, |arm, scope| {
+            // Compare the enum each arm names, not how it was spelled: an arm
+            // may reach the same enum by an import and another by a path.
+            let arm_ty = match arm.enum_path() {
+                [single] => scope.get_alias(&AliasName::from_ident(single)),
+                path => scope.get_alias_at_path(path),
+            }
+            .with_span(arm)?;
+
+            if arm_ty != enum_ty {
                 Err(Error::Grammar {
                     msg: format!(
                         "all match arms must use the same enum; expected '{}', found '{}'",
@@ -3829,6 +3938,135 @@ mod enum_tests {
             result.is_ok(),
             "enum inside `mod` should be accepted: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn a_nested_enum_can_be_named_by_a_path_without_importing_it() {
+        // The ABI names this type `keys::Kind`, so that name has to work in
+        // source too. Only the annotation needs the import.
+        let result = analyze(
+            "mod keys {
+                 pub enum Kind { Cold, Hot, }
+             }
+             use crate::keys::Kind;
+             fn main() {
+                 let k: Kind = keys::Kind::Hot;
+                 match k {
+                     keys::Kind::Cold => {},
+                     keys::Kind::Hot => {},
+                 }
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "a qualified path should name the enum: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn match_arms_may_mix_an_import_and_a_path_for_one_enum() {
+        // The arms must agree on the enum, not on how it is spelled.
+        let result = analyze(
+            "mod keys {
+                 pub enum Kind { Cold, Hot, }
+             }
+             use crate::keys::Kind;
+             fn main() {
+                 let k: Kind = Kind::Hot;
+                 let _n: u32 = match k {
+                     Kind::Cold => 1,
+                     keys::Kind::Hot => 2,
+                 };
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "both arms name the same enum: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn match_arms_naming_two_enums_are_still_rejected() {
+        let result = analyze(
+            "enum Kind { Cold, Hot, }
+             enum Other { Cold, Hot, }
+             fn main() {
+                 let k: Kind = Kind::Hot;
+                 let _n: u32 = match k {
+                     Kind::Cold => 1,
+                     Other::Hot => 2,
+                 };
+             }",
+        );
+        assert!(result.is_err(), "arms naming two enums must be rejected");
+    }
+
+    #[test]
+    fn a_path_that_resolves_two_ways_is_rejected() {
+        // `keys` names a module both at the root and inside `outer`. Preferring
+        // one silently would hide the other, and no syntax can reach it, since
+        // `crate` cannot be written in expression position.
+        let result = analyze(
+            "mod keys {
+                 pub enum Kind { Cold, Hot, }
+             }
+             mod outer {
+                 pub mod keys {
+                     pub enum Kind { Slow, Fast, }
+                 }
+                 use crate::outer::keys::Kind;
+                 fn pick() -> Kind {
+                     keys::Kind::Fast
+                 }
+             }
+             fn main() {}",
+        );
+        let err = result.expect_err("the path resolves two ways");
+        assert!(
+            err.contains("from the root of the program"),
+            "the error should say the path is ambiguous: {err}"
+        );
+    }
+
+    #[test]
+    fn a_path_to_a_private_enum_is_rejected() {
+        // A path reaches past the point a `use` would have been checked, so
+        // the visibility check has to happen at the path instead.
+        let result = analyze(
+            "mod keys {
+                 enum Kind { Cold, Hot, }
+             }
+             fn main() {
+                 let _k: u32 = match keys::Kind::Hot {
+                     keys::Kind::Cold => 1,
+                     keys::Kind::Hot => 2,
+                 };
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "a private enum must not be reachable by path"
+        );
+    }
+
+    #[test]
+    fn a_path_naming_no_module_is_rejected() {
+        let result = analyze(
+            "mod keys {
+                 pub enum Kind { Cold, Hot, }
+             }
+             use crate::keys::Kind;
+             fn main() {
+                 let _k: Kind = locks::Kind::Hot;
+             }",
+        );
+        let err = result.expect_err("`locks` does not name a module");
+        assert!(
+            err.contains("locks"),
+            "the error should name the missing module: {err}"
         );
     }
 

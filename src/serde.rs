@@ -1,11 +1,11 @@
 use core::hash::Hash;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
 
 use crate::parse::ParseFromStr as _;
 use crate::str::Identifier;
-use crate::types::ResolvedType;
+use crate::types::{EnumInfo, EnumVariantInfo, ResolvedType};
 use crate::value::Value;
 use crate::witness::{
     Arguments, UnresolvedValue, UnresolvedValues, WitnessNameToValueMap as _, WitnessValues,
@@ -128,9 +128,65 @@ impl Serialize for AbiMeta {
     {
         use ::serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("AbiMeta", 2)?;
+        let enum_types = self.enum_definitions();
+
+        let mut state = serializer.serialize_struct("AbiMeta", 3)?;
         state.serialize_field("witness_types", &self.witness_types)?;
         state.serialize_field("parameter_types", &self.param_types)?;
+        state.serialize_field("enum_types", &EnumDefinitions(&enum_types))?;
+        state.end()
+    }
+}
+
+/// The enum definitions an ABI's types depend on, so a consumer holding only
+/// the JSON can encode and validate enum values without the program source.
+struct EnumDefinitions<'a>(&'a BTreeMap<String, EnumInfo>);
+
+impl Serialize for EnumDefinitions<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, info) in self.0 {
+            map.serialize_entry(name, &Variants(info))?;
+        }
+        map.end()
+    }
+}
+
+/// An enum's variants in declaration order, which is what determines the wire
+/// encoding: reordering them changes the program without changing any name.
+struct Variants<'a>(&'a EnumInfo);
+
+impl Serialize for Variants<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use ::serde::ser::SerializeSeq;
+
+        let variants = self.0.variants();
+        let mut seq = serializer.serialize_seq(Some(variants.len()))?;
+        for variant in variants {
+            seq.serialize_element(&Variant(variant))?;
+        }
+        seq.end()
+    }
+}
+
+struct Variant<'a>(&'a EnumVariantInfo);
+
+impl Serialize for Variant<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use ::serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("Variant", 2)?;
+        state.serialize_field("name", self.0.name().as_str())?;
+        state.serialize_field("payload", self.0.payload())?;
         state.end()
     }
 }
@@ -385,6 +441,66 @@ mod tests {
         assert_eq!(json["MAYBE"], "Option<Action>");
         assert_eq!(json["PAIR"], "(Action, Reaction)");
         assert_eq!(json["PLAIN"], "u32");
+    }
+
+    #[test]
+    fn abi_carries_the_definition_of_every_enum_it_mentions() {
+        use crate::str::ModuleName;
+        use crate::types::{EnumInfo, EnumVariantInfo};
+        use std::sync::Arc;
+
+        fn unit_variants(names: &[&str]) -> Arc<[EnumVariantInfo]> {
+            names
+                .iter()
+                .map(|name| {
+                    EnumVariantInfo::new(Identifier::from_str_unchecked(name), Arc::from([]))
+                })
+                .collect()
+        }
+
+        // Declared in `mod keys`, and reachable only through a variant of
+        // `Action`: the walk has to follow variant payloads to find it.
+        let kind = ResolvedType::enumeration(EnumInfo::new_in_module(
+            Arc::from([ModuleName::from_str_unchecked("keys")]),
+            Arc::from("Kind"),
+            unit_variants(&["Cold", "Hot"]),
+        ));
+
+        let action = ResolvedType::enumeration(EnumInfo::new(
+            Arc::from("Action"),
+            Arc::from([
+                EnumVariantInfo::new(Identifier::from_str_unchecked("Spend"), Arc::from([])),
+                EnumVariantInfo::new(
+                    Identifier::from_str_unchecked("Rotate"),
+                    Arc::from([kind]),
+                ),
+            ]),
+        ));
+
+        let abi = AbiMeta {
+            witness_types: WitnessTypes::from(HashMap::from([(
+                TemplateProgramWitness::witness_from_str("ACT"),
+                action,
+            )])),
+            param_types: Parameters::from(HashMap::new()),
+        };
+
+        let json = serde_json::to_value(&abi).unwrap();
+
+        assert_eq!(json["witness_types"]["ACT"], "Action");
+
+        // Declaration order is the wire encoding, so it has to be preserved.
+        assert_eq!(json["enum_types"]["Action"][0]["name"], "Spend");
+        assert_eq!(json["enum_types"]["Action"][1]["name"], "Rotate");
+        assert_eq!(json["enum_types"]["Action"][1]["payload"][0], "keys::Kind");
+
+        // The nested enum is named by its module and carries its own variants.
+        assert_eq!(json["enum_types"]["keys::Kind"][0]["name"], "Cold");
+        assert_eq!(json["enum_types"]["keys::Kind"][1]["name"], "Hot");
+        assert!(
+            json["enum_types"]["Kind"].is_null(),
+            "the bare name must not appear: it is not the type's identity"
+        );
     }
 
     #[test]
