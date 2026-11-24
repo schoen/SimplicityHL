@@ -40,9 +40,9 @@ Operators on booleans and unsigned integers:
 
 | Operators | Operand types | Result type |
 | --- | --- | --- |
-| `==` `!=` | `bool`, `u1`, `u8`, `u16`, `u32`, `u64`, `u256` | `bool` |
-| `<` `<=` `>` `>=` | `u8`, `u16`, `u32`, `u64` | `bool` |
-| `&` `\|` `^` | `bool`, `u1`, `u8`, `u16`, `u32`, `u64` | the operand type |
+| `==` `!=` | `bool`, `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64`, `u256` | `bool` |
+| `<` `<=` `>` `>=` | `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64` | `bool` |
+| `&` `\|` `^` | `bool`, `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64` | the operand type |
 | `&&` `\|\|` | `bool` | `bool` |
 | `!` (prefix) | `bool` | `bool` |
 

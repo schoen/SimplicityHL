@@ -1352,6 +1352,42 @@ fn main() {
     }
 
     #[test]
+    fn operators_on_narrow_integers() {
+        operator_test(
+            "    let x: u4 = 0b1010;
+    let y: u4 = 0b0110;
+    assert!(x & y == 0b0010);
+    assert!(x | y == 0b1110);
+    assert!(x ^ y == 0b1100);
+    assert!(x != y);
+    assert!(x == 0b1010);
+    assert!(y < x);
+    assert!(y <= x);
+    assert!(x > y);
+    assert!(x >= x);
+    assert!(!(x < y));
+    let big: u4 = 0b1111;
+    assert!(big > x);
+    let p: u2 = 2;
+    let q: u2 = 1;
+    assert!(p & q == 0);
+    assert!(p | q == 3);
+    assert!(p ^ q == 3);
+    assert!(p != q);
+    assert!(p > q);
+    assert!(!(p < q));
+    let one: u1 = 1;
+    let zero: u1 = 0;
+    assert!(zero < one);
+    assert!(one >= zero);
+    assert!(!(one < zero));
+    assert!(one <= one);",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
     fn comparison_type_errors() {
         let error = operator_compile_error("    assert!(3 == 4);");
         assert!(

@@ -131,6 +131,25 @@ fn bitwise(
         ));
     }
 
+    // There are no jets for `u2` and `u4`: use the `u8` jet on zero-extended
+    // operands and keep the low bits of the result.
+    if let Some(small @ (UIntType::U2 | UIntType::U4)) = ty.as_integer() {
+        let small = small_width(small);
+        let wide = parse::SingleExpression::jet_call(
+            &format!("{name}_8"),
+            vec![
+                extend_to_u8(lhs, small, span),
+                extend_to_u8(rhs, small, span),
+            ],
+            span,
+        );
+        return Ok(parse::SingleExpression::jet_call(
+            &format!("rightmost_8_{small}"),
+            vec![wide.into_expression()],
+            span,
+        ));
+    }
+
     let width = match ty.as_integer() {
         Some(UIntType::U1) => 1,
         Some(UIntType::U8) => 8,
@@ -164,27 +183,39 @@ fn comparison(
         ty: operand_ty.clone(),
     };
 
-    // Booleans compare as `u1`, which has the same representation.
+    let is_ordering = !matches!(op, InfixOp::Eq | InfixOp::Ne);
+
     let (width, lhs, rhs) = if operand_ty.is_boolean() {
+        // Booleans compare as `u1`, which has the same representation.
+        if is_ordering {
+            return Err(unsupported());
+        }
         (1, bool_to_u1(lhs, span), bool_to_u1(rhs, span))
     } else {
-        let width = match operand_ty.as_integer() {
-            Some(UIntType::U1) => 1,
-            Some(UIntType::U8) => 8,
-            Some(UIntType::U16) => 16,
-            Some(UIntType::U32) => 32,
-            Some(UIntType::U64) => 64,
-            Some(UIntType::U256) => 256,
+        match operand_ty.as_integer() {
+            // There are no jets for `u2` and `u4`, nor ordering jets for `u1`:
+            // compare the operands zero-extended to `u8`.
+            Some(small @ (UIntType::U2 | UIntType::U4)) => {
+                let small = small_width(small);
+                (
+                    8,
+                    extend_to_u8(lhs, small, span),
+                    extend_to_u8(rhs, small, span),
+                )
+            }
+            Some(UIntType::U1) if is_ordering => {
+                (8, extend_to_u8(lhs, 1, span), extend_to_u8(rhs, 1, span))
+            }
+            Some(UIntType::U1) => (1, lhs, rhs),
+            Some(UIntType::U8) => (8, lhs, rhs),
+            Some(UIntType::U16) => (16, lhs, rhs),
+            Some(UIntType::U32) => (32, lhs, rhs),
+            Some(UIntType::U64) => (64, lhs, rhs),
+            // `eq_256` exists, but `lt_256` and `le_256` don't.
+            Some(UIntType::U256) if !is_ordering => (256, lhs, rhs),
             _ => return Err(unsupported()),
-        };
-        (width, lhs, rhs)
+        }
     };
-
-    // `eq_N` exists for every width above; `lt_N` and `le_N` only for these.
-    let is_ordering = !matches!(op, InfixOp::Eq | InfixOp::Ne);
-    if is_ordering && !matches!(width, 8 | 16 | 32 | 64) {
-        return Err(unsupported());
-    }
 
     let jet = |name: &str, args| {
         parse::SingleExpression::jet_call(&format!("{name}_{width}"), args, span)
@@ -258,4 +289,40 @@ fn operand_type(expression: &parse::Expression, scope: &Scope) -> Option<Resolve
         },
         _ => None,
     }
+}
+
+/// The width of `u1`, `u2` or `u4`.
+fn small_width(ty: UIntType) -> usize {
+    match ty {
+        UIntType::U1 => 1,
+        UIntType::U2 => 2,
+        UIntType::U4 => 4,
+        _ => unreachable!("`{ty}` is not narrower than `u8`"),
+    }
+}
+
+/// Zero-extend a `u1`, `u2` or `u4` operand of the given width to `u8`, one
+/// doubling at a time. `<(u4, u4)>::into((0, x))` is the `u8` whose high half
+/// is zero and whose low half is `x`.
+fn extend_to_u8(operand: parse::Expression, width: usize, span: Span) -> parse::Expression {
+    let mut extended = operand;
+    let mut width = width;
+    while width < 8 {
+        let half = AliasedType::from(match width {
+            1 => UIntType::U1,
+            2 => UIntType::U2,
+            4 => UIntType::U4,
+            _ => unreachable!("width {width} is not 1, 2 or 4"),
+        });
+        let zero = parse::SingleExpression::decimal("0", span).into_expression();
+        let pair = parse::SingleExpression::tuple(vec![zero, extended], span).into_expression();
+        extended = parse::SingleExpression::type_cast(
+            AliasedType::tuple([half.clone(), half]),
+            pair,
+            span,
+        )
+        .into_expression();
+        width *= 2;
+    }
+    extended
 }

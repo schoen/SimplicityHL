@@ -682,6 +682,22 @@ impl SingleExpression {
         }
     }
 
+    /// Build the decimal literal `digits`.
+    pub(crate) fn decimal(digits: &str, span: Span) -> Self {
+        Self {
+            inner: SingleExpressionInner::Decimal(Decimal::from_str_unchecked(digits)),
+            span,
+        }
+    }
+
+    /// Build the tuple `(elements)`.
+    pub(crate) fn tuple(elements: Vec<Expression>, span: Span) -> Self {
+        Self {
+            inner: SingleExpressionInner::Tuple(Arc::from(elements)),
+            span,
+        }
+    }
+
     /// Build `match scrutinee { false => if_false, true => if_true }`.
     pub(crate) fn bool_match(
         scrutinee: Expression,
