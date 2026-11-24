@@ -1,0 +1,5 @@
+// error: OperatorOperandTypeUnknown
+// flags: infix_operators
+fn main() {
+    assert!(3 == 4);
+}

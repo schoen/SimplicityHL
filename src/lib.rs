@@ -1266,6 +1266,116 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn comparison_operators() {
+        operator_test(
+            "    let a: u8 = 20;
+    let b: u8 = 6;
+    assert!(a == a);
+    assert!(!(a == b));
+    assert!(a != b);
+    assert!(!(a != a));
+    assert!(b < a);
+    assert!(!(a < b));
+    assert!(!(a < a));
+    assert!(b <= a);
+    assert!(a <= a);
+    assert!(!(a <= b));
+    assert!(a > b);
+    assert!(!(b > a));
+    assert!(!(a > a));
+    assert!(a >= b);
+    assert!(a >= a);
+    assert!(!(b >= a));
+    let c: u16 = 1000;
+    assert!(c > 999);
+    let d: u32 = 100000;
+    assert!(d <= 100000);
+    let e: u64 = 10000000000;
+    assert!(e >= 9999999999);
+    let one: u1 = 1;
+    assert!(one == 1);
+    assert!(one != 0);
+    let h: u256 = 0x0000000000000000000000000000000000000000000000000000000000000001;
+    assert!(h == h);
+    assert!(h != 0x0000000000000000000000000000000000000000000000000000000000000000);
+    let t: bool = true;
+    let f: bool = false;
+    assert!(t == t);
+    assert!(t != f);
+    assert!(f == false);
+    assert!(!(t == f));",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
+    fn comparison_operand_types() {
+        let text = "fn twenty() -> u8 {
+    20
+}
+
+fn main() {
+    let a: u8 = 20;
+    let b: u8 = 6;
+    // A literal takes its type from the other operand, on either side.
+    assert!(a == 20);
+    assert!(20 == a);
+    assert!(6 < a);
+    // The types of jet and function calls are known.
+    assert!(jet::max_8(a, b) == 20);
+    assert!(20 == jet::max_8(a, b));
+    assert!(twenty() == a);
+    assert!(b < twenty());
+    // So are the types of parenthesized and bitwise expressions.
+    assert!((a) == 20);
+    assert!(a & 4 == 4);
+    assert!(4 == 4 & a);
+    // Comparisons combine with logical operators.
+    assert!(a > b && b > 0 || false);
+    assert!((a == b) == false);
+}
+";
+        TestCase::program_text_with_unstable(Cow::Borrowed(text), UnstableFeatures::all())
+            .with_witness_values(WitnessValues::default())
+            .assert_run_success();
+    }
+
+    #[test]
+    fn comparison_type_errors() {
+        let error = operator_compile_error("    assert!(3 == 4);");
+        assert!(
+            error.contains("Cannot determine the type of the operands of `==`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let a: u128 = 1;\n    assert!(a < a);");
+        assert!(
+            error.contains("Operator `<` cannot be applied to values of type `u128`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let t: bool = true;\n    assert!(t < t);");
+        assert!(
+            error.contains("Operator `<` cannot be applied to values of type `bool`"),
+            "Unexpected error: {error}"
+        );
+
+        let error =
+            operator_compile_error("    let a: u8 = 1;\n    let b: u16 = 2;\n    assert!(a == b);");
+        assert!(
+            error.contains("Expected expression of type `u8`, found type `u16`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let a: u8 = 1;\n    let x: u8 = a == a;");
+        assert!(
+            error.contains("Expected expression of type `u8`, found type `bool`"),
+            "Unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn regression_153() {
         TestCase::program_file("./fixtures/array_fold_2n.simf")
             .with_witness_values(WitnessValues::default())

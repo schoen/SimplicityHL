@@ -102,6 +102,7 @@ coverage! {
     ExpressionUnexpectedType => Tested,
     ExpressionTypeMismatch => Tested,
     OperatorUnsupportedType => Tested,
+    OperatorOperandTypeUnknown => Tested,
     ExpressionNotConstant => Untestable("never constructed"),
     IntegerOutOfBounds => Tested,
     UndefinedVariable => Tested,

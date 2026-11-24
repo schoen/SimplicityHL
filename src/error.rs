@@ -920,6 +920,9 @@ pub enum Error {
         op: &'static str,
         ty: ResolvedType,
     },
+    OperatorOperandTypeUnknown {
+        op: &'static str,
+    },
     ExpressionNotConstant,
     IntegerOutOfBounds {
         ty: UIntType,
@@ -1174,6 +1177,10 @@ impl fmt::Display for Error {
             Error::OperatorUnsupportedType { op, ty } => write!(
                 f,
                 "Operator `{op}` cannot be applied to values of type `{ty}`"
+            ),
+            Error::OperatorOperandTypeUnknown { op } => write!(
+                f,
+                "Cannot determine the type of the operands of `{op}`; assign one operand to a variable with a declared type first"
             ),
             Error::ExpressionNotConstant => write!(
                 f,
