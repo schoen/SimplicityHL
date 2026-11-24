@@ -81,6 +81,9 @@ where
 {
     just(open.clone())
         .map_with(|_, e| e.span())
+        // `<` and `>` aren't a pair here, because a comparison `<` doesn't
+        // have a matching `>`. `nested_delimiters` always nests `open` and
+        // `close`, so the angle brackets of types still nest.
         .then(parser.recover_with(via_parser(nested_delimiters(
             open.clone(),
             close.clone(),
@@ -88,7 +91,6 @@ where
                 (Token::LParen, Token::RParen),
                 (Token::LBracket, Token::RBracket),
                 (Token::LBrace, Token::RBrace),
-                (Token::LAngle, Token::RAngle),
             ],
             fallback,
         ))))

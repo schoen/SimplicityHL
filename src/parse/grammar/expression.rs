@@ -72,12 +72,12 @@ impl ChumskyParse for Expression {
                 // become the block's final expression.
                 let element = Statement::parser(expr.clone()).then(just(Token::Semi).or_not());
 
+                // Not `<` and `>`, which are also comparison operators.
                 let block_recovery = nested_delimiters(
                     Token::LBrace,
                     Token::RBrace,
                     [
                         (Token::LParen, Token::RParen),
-                        (Token::LAngle, Token::RAngle),
                         (Token::LBracket, Token::RBracket),
                     ],
                     |span| Expression::empty(span).inner().clone(),
