@@ -1134,6 +1134,16 @@ pub(crate) mod tests {
             .assert_run_success();
     }
 
+    #[test]
+    fn infix_operators() {
+        TestCase::program_file_with_unstable(
+            "./examples/infix_operators.simf",
+            UnstableFeatures::all(),
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
     /// A function that fails when it is called, to observe which operands
     /// an operator evaluates.
     const BOOM: &str = "fn boom() -> bool {\n    assert!(false);\n    true\n}\n";

@@ -1,5 +1,9 @@
 # Unreleased
 
+## Added
+
+* Add unstable operators on booleans and unsigned integers: `==`, `!=`, `<`, `<=`, `>`, `>=`, `&`, `|`, `^`, `&&`, `||` and prefix `!`. They follow Rust's precedence, and `&&` and `||` evaluate their right operand only when needed. Enable with `-Z infix_operators`. See `doc/unstable-features.md`.
+
 # 0.9.0 - 2026-10-26
 
 ## Breaking Changes

@@ -69,6 +69,7 @@ mod lossless_test {
         hash_loop_lossless: "hash_loop.simf",
         hodl_vault_lossless: "hodl_vault.simf",
         htlc_lossless: "htlc.simf",
+        infix_operators_lossless: "infix_operators.simf",
         last_will_lossless: "last_will.simf",
         modules_lossless: "modules.simf",
         non_interactive_fee_bump_lossless: "non_interactive_fee_bump.simf",

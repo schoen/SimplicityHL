@@ -1,0 +1,28 @@
+/*
+ * OPERATORS
+ *
+ * Comparison, bitwise and logical operators on booleans and unsigned integers.
+ *
+ * Requires `simc -Z infix_operators`.
+ */
+fn is_in_range(x: u32, low: u32, high: u32) -> bool {
+    low <= x && x < high
+}
+
+fn main() {
+    // Bitwise operators bind more tightly than comparisons,
+    // so this is `(flags & 0b00000010) != 0`.
+    let flags: u8 = 0b10110010;
+    assert!(flags & 0b00000010 != 0);
+    assert!(flags | 0b00000001 == 0b10110011);
+    assert!(flags ^ flags == 0);
+
+    assert!(is_in_range(5, 1, 10));
+    assert!(!is_in_range(10, 1, 10));
+
+    // `&&` and `||` evaluate their right operand only when it decides the result.
+    let a: u8 = 20;
+    let b: u8 = 6;
+    assert!(a > b && b >= 6);
+    assert!(a == b || a != b);
+}

@@ -34,6 +34,63 @@ produce the same digest, as does any other type with the same bytes, such as an 
 of `u32` versus a plain `u32`. If your protocol needs the digest to be unambiguous,
 commit to the type yourself, for example by hashing a domain-separation tag first.
 
+## `infix_operators`
+
+Operators on booleans and unsigned integers:
+
+| Operators | Operand types | Result type |
+| --- | --- | --- |
+| `==` `!=` | `bool`, `u1`, `u8`, `u16`, `u32`, `u64`, `u256` | `bool` |
+| `<` `<=` `>` `>=` | `u8`, `u16`, `u32`, `u64` | `bool` |
+| `&` `\|` `^` | `bool`, `u1`, `u8`, `u16`, `u32`, `u64` | the operand type |
+| `&&` `\|\|` | `bool` | `bool` |
+| `!` (prefix) | `bool` | `bool` |
+
+Both operands of a binary operator must have the same type.
+
+```rust
+fn is_in_range(x: u32, low: u32, high: u32) -> bool {
+    low <= x && x < high
+}
+```
+
+Each operator compiles to the corresponding jet, so `a < b` on `u8` values is the
+same as `jet::lt_8(a, b)`, and `a & b` is the same as `jet::and_8(a, b)`.
+
+### Precedence
+
+From the tightest binding to the loosest:
+
+1. `!`
+2. `&`
+3. `^`
+4. `|`
+5. `==` `!=` `<` `<=` `>` `>=`
+6. `&&`
+7. `||`
+
+The bitwise operators bind more tightly than the comparisons, so
+`flags & 0x02 != 0` means `(flags & 0x02) != 0`. Comparisons can't be chained:
+instead of `a < b < c`, write `a < b && b < c`. The other binary operators
+associate to the left.
+
+Write `>=` without a space between `>` and `=`.
+
+### Evaluation
+
+`&&` evaluates its right operand only if its left operand is `true`, and `||`
+only if its left operand is `false`. The other operators evaluate both operands,
+including `&`, `|` and `^` on booleans.
+
+### Operand types
+
+A comparison needs the type of at least one of its operands from the operand
+itself. Variables, function calls, jet calls and boolean expressions have such a
+type. Integer literals, witnesses and parameters take their type from the other
+operand, so `x == 3` works when `x` is a variable, but `3 == 4` is an error. To
+compare two such values, assign one of them to a variable with a declared type
+first.
+
 ## Adding or stabilizing a feature
 
 See the rustdoc on `UnstableFeature` in `src/unstable.rs`; the procedures

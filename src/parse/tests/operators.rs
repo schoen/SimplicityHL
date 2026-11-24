@@ -176,3 +176,28 @@ fn operators_need_unstable_feature() {
         );
     }
 }
+
+#[test]
+fn syntax_errors_near_comparisons_are_reported() {
+    for input in [
+        // An unmatched `<` inside a call whose arguments fail to parse.
+        "fn main() {\n    assert!(jet::eq_8(a < , b));\n}",
+        // A `<` and a later `>` around a syntax error.
+        "fn main() {\n    let x: bool = a < b;\n    let y u8 = 1;\n    let z: bool = c > d;\n}",
+        // A broken block between two functions that use comparisons.
+        "fn f(a: u8) -> bool {\n    a < 3\n}\nfn main() {\n    let = ;\n}\nfn g(a: u8) -> bool {\n    a > 3\n}",
+    ] {
+        let mut diagnostics = DiagnosticManager::new();
+        let program = Program::parse_from_str_with_errors(
+            MAIN_MODULE,
+            input,
+            &UnstableFeatures::all(),
+            &mut diagnostics,
+        );
+        assert!(program.is_none(), "{input:?} must be rejected");
+        assert!(
+            diagnostics.has_errors(),
+            "{input:?} must report an error"
+        );
+    }
+}
