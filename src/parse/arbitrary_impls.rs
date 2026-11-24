@@ -9,10 +9,26 @@ use crate::types::AliasedType;
 use crate::TemplateProgramWitness;
 
 use super::{
-    Assignment, Call, CallName, EnumDeclaration, EnumVariant, Expression, ExpressionInner,
-    Function, FunctionParam, Item, Match, MatchArm, MatchPattern, Module, Program,
-    SingleExpression, SingleExpressionInner, Statement, TypeAlias, UseDecl, UseItems, Visibility,
+    Assignment, BinaryOp, Call, CallName, EnumDeclaration, EnumVariant, Expression,
+    ExpressionInner, Function, FunctionParam, InfixOp, Item, LogicalNot, Match, MatchArm,
+    MatchPattern, Module, Program, SingleExpression, SingleExpressionInner, Statement, TypeAlias,
+    UseDecl, UseItems, Visibility,
 };
+
+/// Wrap an expression in parentheses.
+///
+/// Operands of generated operators are always parenthesized, so that displaying
+/// a generated tree and parsing it again gives the same tree, whatever the
+/// operands' precedence.
+fn parenthesize(expression: Expression) -> Expression {
+    Expression {
+        inner: ExpressionInner::Single(SingleExpression {
+            inner: SingleExpressionInner::Expression(Arc::new(expression)),
+            span: Span::DUMMY,
+        }),
+        span: Span::DUMMY,
+    }
+}
 
 impl<'a> arbitrary::Arbitrary<'a> for UseDecl {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
@@ -257,7 +273,7 @@ impl crate::ArbitraryRec for SingleExpression {
                 6 => Ok(S::Option(None)),
                 _ => unreachable!(),
             },
-            Some(new_budget) => match u.int_in_range(0..=15)? {
+            Some(new_budget) => match u.int_in_range(0..=17)? {
                 0 => bool::arbitrary(u).map(S::Boolean),
                 1 => Binary::arbitrary(u).map(S::Binary),
                 2 => Decimal::arbitrary(u).map(S::Decimal),
@@ -303,6 +319,25 @@ impl crate::ArbitraryRec for SingleExpression {
                         .collect::<arbitrary::Result<Arc<[Expression]>>>()?;
                     Ok(S::List(elements))
                 }
+                16 => {
+                    let op = InfixOp::arbitrary(u)?;
+                    let lhs = Expression::arbitrary_rec(u, new_budget).map(parenthesize)?;
+                    let rhs = Expression::arbitrary_rec(u, new_budget).map(parenthesize)?;
+                    Ok(S::BinaryOp(BinaryOp {
+                        op,
+                        lhs: Arc::new(lhs),
+                        rhs: Arc::new(rhs),
+                        span: Span::DUMMY,
+                    }))
+                }
+                17 => Expression::arbitrary_rec(u, new_budget)
+                    .map(parenthesize)
+                    .map(|operand| {
+                        S::LogicalNot(LogicalNot {
+                            operand: Arc::new(operand),
+                            span: Span::DUMMY,
+                        })
+                    }),
                 _ => unreachable!(),
             },
         }?;

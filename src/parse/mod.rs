@@ -702,6 +702,10 @@ pub enum SingleExpressionInner {
     ///
     /// The exclusive upper bound on the list size is not known at this point
     List(Arc<[Expression]>),
+    /// Infix operator expression: `lhs op rhs`
+    BinaryOp(BinaryOp),
+    /// Logical negation: `!operand`
+    LogicalNot(LogicalNot),
 }
 
 impl_require_feature!(SingleExpressionInner {
@@ -723,7 +727,133 @@ impl_require_feature!(SingleExpressionInner {
         Tuple(exprs),
         Array(exprs),
         List(exprs),
+        BinaryOp(binary_op),
+        LogicalNot(logical_not),
 });
+
+/// Infix operator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum InfixOp {
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `&`
+    BitAnd,
+    /// `^`
+    BitXor,
+    /// `|`
+    BitOr,
+    /// `&&`
+    And,
+    /// `||`
+    Or,
+}
+
+impl InfixOp {
+    /// The operator as written in source code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::BitAnd => "&",
+            Self::BitXor => "^",
+            Self::BitOr => "|",
+            Self::And => "&&",
+            Self::Or => "||",
+        }
+    }
+}
+
+/// Infix operator expression: `lhs op rhs`.
+#[derive(Clone, Debug)]
+pub struct BinaryOp {
+    op: InfixOp,
+    lhs: Arc<Expression>,
+    rhs: Arc<Expression>,
+    span: Span,
+}
+
+impl BinaryOp {
+    /// Access the operator.
+    pub fn op(&self) -> InfixOp {
+        self.op
+    }
+
+    /// Access the left operand.
+    pub fn lhs(&self) -> &Expression {
+        &self.lhs
+    }
+
+    /// Access the right operand.
+    pub fn rhs(&self) -> &Expression {
+        &self.rhs
+    }
+
+    /// Access the span of the whole expression, from the start of the left
+    /// operand to the end of the right operand.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl_eq_hash!(BinaryOp; op, lhs, rhs);
+
+impl_require_feature!(BinaryOp {
+    requires: UnstableFeature::InfixOperators, span: span;
+    recurse: lhs, rhs;
+});
+
+impl AsRef<Span> for BinaryOp {
+    fn as_ref(&self) -> &Span {
+        &self.span
+    }
+}
+
+/// Logical negation: `!operand`.
+#[derive(Clone, Debug)]
+pub struct LogicalNot {
+    operand: Arc<Expression>,
+    span: Span,
+}
+
+impl LogicalNot {
+    /// Access the negated operand.
+    pub fn operand(&self) -> &Expression {
+        &self.operand
+    }
+
+    /// Access the span of the whole expression, including the `!`.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl_eq_hash!(LogicalNot; operand);
+
+impl_require_feature!(LogicalNot {
+    requires: UnstableFeature::InfixOperators, span: span;
+    recurse: operand;
+});
+
+impl AsRef<Span> for LogicalNot {
+    fn as_ref(&self) -> &Span {
+        &self.span
+    }
+}
 
 /// Match expression.
 #[derive(Clone, Debug)]
@@ -1059,6 +1189,8 @@ pub enum ExprTree<'a> {
     Match(&'a Match),
     EnumMatch(&'a EnumMatch),
     EnumConstruction(&'a EnumConstruction),
+    BinaryOp(&'a BinaryOp),
+    LogicalNot(&'a LogicalNot),
 }
 
 impl TreeLike for ExprTree<'_> {
@@ -1106,6 +1238,8 @@ impl TreeLike for ExprTree<'_> {
                 S::Tuple(elements) | S::Array(elements) | S::List(elements) => {
                     Tree::Nary(elements.iter().map(Self::Expression).collect())
                 }
+                S::BinaryOp(binary_op) => Tree::Unary(Self::BinaryOp(binary_op)),
+                S::LogicalNot(logical_not) => Tree::Unary(Self::LogicalNot(logical_not)),
             },
             Self::Call(call) => Tree::Nary(call.args().iter().map(Self::Expression).collect()),
             Self::EnumConstruction(construction) => {
@@ -1116,6 +1250,11 @@ impl TreeLike for ExprTree<'_> {
                 Self::Expression(match_.left().expression()),
                 Self::Expression(match_.right().expression()),
             ])),
+            Self::BinaryOp(binary_op) => Tree::Nary(Arc::new([
+                Self::Expression(binary_op.lhs()),
+                Self::Expression(binary_op.rhs()),
+            ])),
+            Self::LogicalNot(logical_not) => Tree::Unary(Self::Expression(logical_not.operand())),
             Self::EnumMatch(enum_match) => Tree::Nary(
                 std::iter::once(Self::Expression(enum_match.scrutinee()))
                     .chain(

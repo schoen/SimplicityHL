@@ -67,6 +67,16 @@ const CONSTRUCTS: &[Construct] = &[
         name: "parentheses",
         build: |depth| wrap_expression(&"(".repeat(depth), &")".repeat(depth)),
     },
+    // Operators nest through prefix `!`, and through parenthesized operands at
+    // every precedence level.
+    Construct {
+        name: "negations",
+        build: |depth| wrap_expression(&"!".repeat(depth), ""),
+    },
+    Construct {
+        name: "parenthesized operators",
+        build: |depth| wrap_expression(&"(0 == 0 || ".repeat(depth), &")".repeat(depth)),
+    },
     // Types have their own recursive parser, and three ways to nest.
     Construct {
         name: "option types",

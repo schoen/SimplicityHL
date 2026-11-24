@@ -293,6 +293,11 @@ impl AbstractSyntaxTree for SingleExpression {
             parse::SingleExpressionInner::EnumMatch(enum_match) => {
                 EnumMatch::analyze(enum_match, ty, scope).map(SingleExpressionInner::EnumMatch)?
             }
+            parse::SingleExpressionInner::BinaryOp(..)
+            | parse::SingleExpressionInner::LogicalNot(..) => Err(Error::Grammar {
+                msg: "Operators are not supported yet".to_string(),
+            })
+            .with_span(from)?,
         };
 
         Ok(Self {

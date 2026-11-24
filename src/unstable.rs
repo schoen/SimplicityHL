@@ -36,6 +36,10 @@ pub enum UnstableFeature {
     /// Raw-hash syntax: the `raw_hash::<T>(tuple)` builtin, which hashes a
     /// tuple of unsigned integers. Enable with `simc -Z raw_hash`.
     RawHash,
+    /// Infix and prefix operators on booleans and unsigned integers:
+    /// `==`, `!=`, `<`, `<=`, `>`, `>=`, `&`, `|`, `^`, `&&`, `||` and `!`.
+    /// Enable with `simc -Z infix_operators`.
+    InfixOperators,
 }
 
 impl UnstableFeature {
@@ -49,7 +53,12 @@ impl UnstableFeature {
     /// Append the new variant here, bump the count in
     /// `all_contains_every_variant` ( in the `tests` module below), then
     /// gate the syntax via [`RequireFeature`].
-    pub const ALL: &'static [Self] = &[Self::Imports, Self::Enums, Self::RawHash];
+    pub const ALL: &'static [Self] = &[
+        Self::Imports,
+        Self::Enums,
+        Self::RawHash,
+        Self::InfixOperators,
+    ];
 
     /// Human-readable description shown next to the feature's name under
     /// `simc --help`.
@@ -63,6 +72,9 @@ impl UnstableFeature {
             }
             Self::RawHash => {
                 "Raw-hash syntax: the 'raw_hash::<T>(tuple)' builtin for hashing a tuple of unsigned integers"
+            }
+            Self::InfixOperators => {
+                "Operators on booleans and unsigned integers: ==, !=, <, <=, >, >=, &, |, ^, &&, || and !"
             }
         }
     }
@@ -227,6 +239,7 @@ impl fmt::Display for UnstableFeature {
             Self::Imports => write!(f, "imports"),
             Self::Enums => write!(f, "enums"),
             Self::RawHash => write!(f, "raw_hash"),
+            Self::InfixOperators => write!(f, "infix_operators"),
         }
     }
 }
@@ -241,6 +254,7 @@ impl FromStr for UnstableFeature {
             "imports" => Ok(UnstableFeature::Imports),
             "enums" => Ok(UnstableFeature::Enums),
             "raw_hash" => Ok(UnstableFeature::RawHash),
+            "infix_operators" => Ok(UnstableFeature::InfixOperators),
             _ => Err(format!("Unknown unstable feature: '{s}'")),
         }
     }
@@ -363,7 +377,7 @@ mod tests {
         // the variant to `ALL`. Pins that `ALL` stays complete.
         assert_eq!(
             all_features.len(),
-            3,
+            4,
             "update this count when adding a feature"
         );
 

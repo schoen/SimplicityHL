@@ -13,8 +13,8 @@ use crate::str::Identifier;
 use crate::TemplateProgramWitness;
 
 use super::super::{
-    Call, EnumConstruction, Expression, ExpressionInner, SingleExpression, SingleExpressionInner,
-    Statement,
+    BinaryOp, Call, EnumConstruction, Expression, ExpressionInner, InfixOp, LogicalNot,
+    SingleExpression, SingleExpressionInner, Statement,
 };
 use super::matching::match_expr_parser;
 use super::{delimited_with_recovery, ChumskyParse, ParseError};
@@ -218,7 +218,7 @@ impl SingleExpression {
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map(|es| SingleExpressionInner::Expression(Arc::from(es)));
 
-        choice((
+        let atom = choice((
             left,
             right,
             some,
@@ -238,5 +238,130 @@ impl SingleExpression {
             inner,
             span: e.span(),
         })
+        .boxed();
+
+        // Operators, from the tightest binding to the loosest, as in Rust:
+        // `!`, `&`, `^`, `|`, comparisons, `&&`, `||`. Each level is boxed, because
+        // it refers to the level below twice and the parser's type would otherwise
+        // double in size at every level.
+
+        let not = just(Token::Bang)
+            .map_with(|_, e| -> Span { e.span() })
+            .repeated()
+            .foldr(atom, |bang, operand| {
+                let span = join_spans(bang, operand.span);
+                Self {
+                    inner: SingleExpressionInner::LogicalNot(LogicalNot {
+                        operand: Arc::new(operand.into_expression()),
+                        span,
+                    }),
+                    span,
+                }
+            })
+            .boxed();
+
+        let bit_and = binary_level(not, just(Token::Amp).to(InfixOp::BitAnd)).boxed();
+        let bit_xor = binary_level(bit_and, just(Token::Caret).to(InfixOp::BitXor)).boxed();
+        let bit_or = binary_level(bit_xor, just(Token::Pipe).to(InfixOp::BitOr)).boxed();
+
+        // The lexer has no `>=` token, because in `let x: Option<u8>= None;` the `>`
+        // closes a type. In operator position, `>` directly followed by `=` is `>=`.
+        let ge = just(Token::RAngle)
+            .map_with(|_, e| -> Span { e.span() })
+            .then(just(Token::Eq).map_with(|_, e| -> Span { e.span() }))
+            .validate(|(gt, eq), _, emit| {
+                if gt.end != eq.start {
+                    emit.emit(
+                        Error::Grammar {
+                            msg: "Expected `>=`, found `> =`".to_string(),
+                        }
+                        .with_span(join_spans(gt, eq))
+                        .with_help("remove the space between `>` and `=`"),
+                    );
+                }
+                InfixOp::Ge
+            });
+
+        let comparison_op = choice((
+            just(Token::EqEq).to(InfixOp::Eq),
+            just(Token::BangEq).to(InfixOp::Ne),
+            just(Token::LtEq).to(InfixOp::Le),
+            just(Token::LAngle).to(InfixOp::Lt),
+            ge,
+            just(Token::RAngle).to(InfixOp::Gt),
+        ));
+
+        // Comparisons don't associate: `a < b < c` is an error, as in Rust.
+        let comparison = bit_or
+            .clone()
+            .then(comparison_op.then(bit_or).repeated().collect::<Vec<_>>())
+            .validate(|(first, rest), _, emit| {
+                if rest.len() > 1 {
+                    let last = rest.last().expect("rest has two elements").1.span;
+                    emit.emit(
+                        Error::Grammar {
+                            msg: "Comparison operators cannot be chained".to_string(),
+                        }
+                        .with_span(join_spans(first.span, last))
+                        .with_help("use parentheses, or `&&` between two comparisons"),
+                    );
+                }
+                rest.into_iter()
+                    .fold(first, |lhs, (op, rhs)| Self::binary(lhs, op, rhs))
+            })
+            .boxed();
+
+        let and = binary_level(comparison, just(Token::AmpAmp).to(InfixOp::And)).boxed();
+        binary_level(and, just(Token::PipePipe).to(InfixOp::Or)).boxed()
     }
+
+    /// Wrap the single expression into an expression.
+    fn into_expression(self) -> Expression {
+        Expression {
+            span: self.span,
+            inner: ExpressionInner::Single(self),
+        }
+    }
+
+    /// Build the infix operator expression `lhs op rhs`.
+    fn binary(lhs: Self, op: InfixOp, rhs: Self) -> Self {
+        let span = join_spans(lhs.span, rhs.span);
+        Self {
+            inner: SingleExpressionInner::BinaryOp(BinaryOp {
+                op,
+                lhs: Arc::new(lhs.into_expression()),
+                rhs: Arc::new(rhs.into_expression()),
+                span,
+            }),
+            span,
+        }
+    }
+}
+
+/// The smallest span that covers both spans.
+///
+/// Spans from error recovery need not be in source order, so this doesn't
+/// assume that `first` starts before `second`.
+fn join_spans(first: Span, second: Span) -> Span {
+    Span::new(
+        first.file_id,
+        first.start.min(second.start)..first.end.max(second.end),
+    )
+}
+
+/// One left-associative level of infix operators: `operand (op operand)*`.
+fn binary_level<'tokens, 'src: 'tokens, I, P, O>(
+    operand: P,
+    op: O,
+) -> impl Parser<'tokens, I, SingleExpression, ParseError<'src>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    P: Parser<'tokens, I, SingleExpression, ParseError<'src>> + Clone,
+    O: Parser<'tokens, I, InfixOp, ParseError<'src>> + Clone,
+{
+    operand
+        .clone()
+        .foldl(op.then(operand).repeated(), |lhs, (op, rhs)| {
+            SingleExpression::binary(lhs, op, rhs)
+        })
 }

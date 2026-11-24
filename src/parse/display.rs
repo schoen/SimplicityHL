@@ -5,9 +5,15 @@ use miniscript::iter::TreeLike;
 
 use super::{
     Assignment, Call, CallName, EnumDeclaration, EnumMatch, EnumMatchArm, ExprTree, Expression,
-    Function, FunctionParam, Item, Match, MatchPattern, Module, Program, SingleExpression,
+    Function, FunctionParam, InfixOp, Item, Match, MatchPattern, Module, Program, SingleExpression,
     SingleExpressionInner, Statement, TypeAlias, UseDecl, UseItems, Visibility,
 };
+
+impl fmt::Display for InfixOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 impl fmt::Display for EnumDeclaration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -242,7 +248,12 @@ impl fmt::Display for ExprTree<'_> {
                             write!(f, ")")?;
                         }
                     },
-                    S::Call(..) | S::Match(..) | S::EnumMatch(..) | S::EnumConstruction(..) => {}
+                    S::Call(..)
+                    | S::Match(..)
+                    | S::EnumMatch(..)
+                    | S::EnumConstruction(..)
+                    | S::BinaryOp(..)
+                    | S::LogicalNot(..) => {}
                     S::Tuple(tuple) => {
                         if data.n_children_yielded == 0 {
                             write!(f, "(")?;
@@ -313,6 +324,19 @@ impl fmt::Display for ExprTree<'_> {
                         write!(f, ",\n}}")?;
                     }
                 },
+                // Operands are printed as parsed. Precedence that differs from the
+                // tree's shape is always written with parentheses, which are
+                // `SingleExpressionInner::Expression` nodes of their own.
+                Self::BinaryOp(binary_op) => match data.n_children_yielded {
+                    0 => {}
+                    1 => write!(f, " {} ", binary_op.op())?,
+                    n => debug_assert_eq!(n, 2),
+                },
+                Self::LogicalNot(..) => {
+                    if data.n_children_yielded == 0 {
+                        write!(f, "!")?;
+                    }
+                }
                 Self::EnumMatch(enum_match) => match data.n_children_yielded {
                     0 => write!(f, "match ")?,
                     1 => write!(f, "{{\n{} => ", enum_match.arms()[0])?,
