@@ -575,6 +575,8 @@ pub(crate) mod tests {
 
     use crate::*;
 
+    mod operators;
+
     const FLATTENED: &str = "flattened.simf";
     pub(crate) const MAIN: &str = "main.simf";
 
@@ -1433,9 +1435,8 @@ fn main() {
 
     #[test]
     fn wide_operators_do_not_capture_variables() {
-        // The rewriting of operators on `u128` binds halves named `lhs_high`,
-        // `lhs_low`, `rhs_high` and `rhs_low`. Variables of the same names
-        // must still mean the program's own variables.
+        // Variables named like ones that the rewriting of operators could
+        // bind must still mean the program's own variables.
         operator_test(
             "    let lhs_high: u128 = 5;
     let rhs_high: u128 = 7;
