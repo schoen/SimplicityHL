@@ -1262,9 +1262,9 @@ pub(crate) mod tests {
             "Unexpected error: {error}"
         );
 
-        let error = operator_compile_error("    let x: u128 = 1 | 2;");
+        let error = operator_compile_error("    let x: [u8; 2] = [1, 2] | [3, 4];");
         assert!(
-            error.contains("Operator `|` cannot be applied to values of type `u128`"),
+            error.contains("Operator `|` cannot be applied to values of type `[u8; 2]`"),
             "Unexpected error: {error}"
         );
 
@@ -1388,6 +1388,69 @@ fn main() {
     }
 
     #[test]
+    fn operators_on_wide_integers() {
+        operator_test(
+            "    let a: u128 = 0x0000000000000001ffffffffffffffff;
+    let b: u128 = 0x00000000000000020000000000000000;
+    let c: u128 = 0x0000000000000001fffffffffffffffe;
+    assert!(a < b);
+    assert!(a <= b);
+    assert!(b > a);
+    assert!(b >= a);
+    assert!(!(b < a));
+    assert!(!(b <= a));
+    assert!(c < a);
+    assert!(!(a < c));
+    assert!(c <= a);
+    assert!(a > c);
+    assert!(a == a);
+    assert!(a != b);
+    assert!(a != c);
+    assert!(!(a < a));
+    assert!(a <= a);
+    assert!(a & b == 0x00000000000000000000000000000000);
+    assert!(a | b == 0x0000000000000003ffffffffffffffff);
+    assert!(a ^ c == 0x00000000000000000000000000000001);
+    let x: u256 = 0x0000000000000000000000000000000100000000000000000000000000000000;
+    let y: u256 = 0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff;
+    let z: u256 = 0x00000000000000000000000000000000fffffffffffffffffffffffffffffffe;
+    assert!(y < x);
+    assert!(x > y);
+    assert!(!(x <= y));
+    assert!(x >= x);
+    assert!(z < y);
+    assert!(!(y < z));
+    assert!(y >= z);
+    assert!(x != y);
+    assert!(x == x);
+    assert!(x & y == 0x0000000000000000000000000000000000000000000000000000000000000000);
+    assert!(x | y == 0x00000000000000000000000000000001ffffffffffffffffffffffffffffffff);
+    assert!(y ^ z == 0x0000000000000000000000000000000000000000000000000000000000000001);",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
+    fn wide_operators_do_not_capture_variables() {
+        // The rewriting of operators on `u128` binds halves named `lhs_high`,
+        // `lhs_low`, `rhs_high` and `rhs_low`. Variables of the same names
+        // must still mean the program's own variables.
+        operator_test(
+            "    let lhs_high: u128 = 5;
+    let rhs_high: u128 = 7;
+    let lhs_low: u128 = 3;
+    assert!(lhs_high < rhs_high);
+    assert!(rhs_high > lhs_high);
+    assert!(lhs_low < lhs_high);
+    assert!(lhs_high & rhs_high == 5);
+    assert!(lhs_low | lhs_high == 7);",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
     fn comparison_type_errors() {
         let error = operator_compile_error("    assert!(3 == 4);");
         assert!(
@@ -1395,9 +1458,9 @@ fn main() {
             "Unexpected error: {error}"
         );
 
-        let error = operator_compile_error("    let a: u128 = 1;\n    assert!(a < a);");
+        let error = operator_compile_error("    let a: (u8, u8) = (1, 2);\n    assert!(a < a);");
         assert!(
-            error.contains("Operator `<` cannot be applied to values of type `u128`"),
+            error.contains("Operator `<` cannot be applied to values of type `(u8, u8)`"),
             "Unexpected error: {error}"
         );
 

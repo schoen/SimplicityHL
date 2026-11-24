@@ -682,6 +682,55 @@ impl SingleExpression {
         }
     }
 
+    /// Turn an expression into a single expression, putting a block in parentheses.
+    pub(crate) fn from_expression(expression: Expression) -> Self {
+        match expression.inner {
+            ExpressionInner::Single(single) => single,
+            inner @ ExpressionInner::Block(..) => Self {
+                span: expression.span,
+                inner: SingleExpressionInner::Expression(Arc::new(Expression {
+                    inner,
+                    span: expression.span,
+                })),
+            },
+        }
+    }
+
+    /// Build a reference to the variable `name`.
+    pub(crate) fn variable(name: &str, span: Span) -> Self {
+        Self {
+            inner: SingleExpressionInner::Variable(Identifier::from_str_unchecked(name)),
+            span,
+        }
+    }
+
+    /// Build the block `{ statements; final_expression }`.
+    pub(crate) fn block(
+        statements: Vec<Statement>,
+        final_expression: Expression,
+        span: Span,
+    ) -> Expression {
+        Expression {
+            inner: ExpressionInner::Block(Arc::from(statements), Some(Arc::new(final_expression))),
+            span,
+        }
+    }
+
+    /// Build the statement `let pattern: ty = expression;`.
+    pub(crate) fn assignment(
+        pattern: Pattern,
+        ty: AliasedType,
+        expression: Expression,
+        span: Span,
+    ) -> Statement {
+        Statement::Assignment(Assignment {
+            pattern,
+            ty,
+            expression,
+            span,
+        })
+    }
+
     /// Build the decimal literal `digits`.
     pub(crate) fn decimal(digits: &str, span: Span) -> Self {
         Self {

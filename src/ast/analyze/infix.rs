@@ -8,6 +8,7 @@
 use crate::error::{Error, Span, WithSpan};
 use crate::jet::target_type;
 use crate::parse::{self, InfixOp};
+use crate::pattern::Pattern;
 use crate::types::{AliasedType, ResolvedType, TypeConstructible, TypeDeconstructible, UIntType};
 
 use super::super::recovery::Failure;
@@ -156,6 +157,8 @@ fn bitwise(
         Some(UIntType::U16) => 16,
         Some(UIntType::U32) => 32,
         Some(UIntType::U64) => 64,
+        Some(UIntType::U128) => 128,
+        Some(UIntType::U256) => 256,
         _ => {
             return Err(Error::OperatorUnsupportedType {
                 op: op.as_str(),
@@ -163,11 +166,44 @@ fn bitwise(
             })
         }
     };
-    Ok(parse::SingleExpression::jet_call(
-        &format!("{name}_{width}"),
-        vec![lhs, rhs],
+    Ok(parse::SingleExpression::from_expression(bitwise_jets(
+        name, lhs, rhs, width, span,
+    )))
+}
+
+/// Apply the bitwise jet `name` to operands of the given width. Above 64 bits,
+/// where there are no jets, apply it to the high halves and to the low halves.
+fn bitwise_jets(
+    name: &str,
+    lhs: parse::Expression,
+    rhs: parse::Expression,
+    width: usize,
+    span: Span,
+) -> parse::Expression {
+    if width <= 64 {
+        return parse::SingleExpression::jet_call(&format!("{name}_{width}"), vec![lhs, rhs], span)
+            .into_expression();
+    }
+
+    let half = width / 2;
+    let high = bitwise_jets(
+        name,
+        variable(LHS_HIGH, span),
+        variable(RHS_HIGH, span),
+        half,
         span,
-    ))
+    );
+    let low = bitwise_jets(
+        name,
+        variable(LHS_LOW, span),
+        variable(RHS_LOW, span),
+        half,
+        span,
+    );
+    let halves = parse::SingleExpression::tuple(vec![high, low], span).into_expression();
+    let joined =
+        parse::SingleExpression::type_cast(pair_type(uint(half)), halves, span).into_expression();
+    with_halves(lhs, rhs, width, joined, span)
 }
 
 /// Rewrite a comparison of two operands of type `operand_ty` into a jet call.
@@ -211,35 +247,155 @@ fn comparison(
             Some(UIntType::U16) => (16, lhs, rhs),
             Some(UIntType::U32) => (32, lhs, rhs),
             Some(UIntType::U64) => (64, lhs, rhs),
-            // `eq_256` exists, but `lt_256` and `le_256` don't.
-            Some(UIntType::U256) if !is_ordering => (256, lhs, rhs),
+            Some(UIntType::U128) => (128, lhs, rhs),
+            Some(UIntType::U256) => (256, lhs, rhs),
             _ => return Err(unsupported()),
         }
     };
 
-    let jet = |name: &str, args| {
-        parse::SingleExpression::jet_call(&format!("{name}_{width}"), args, span)
-    };
+    let compare = |name, lhs, rhs| comparison_jets(name, lhs, rhs, width, span);
     let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
 
-    Ok(match op {
-        InfixOp::Eq => jet("eq", vec![lhs, rhs]),
+    let rewritten = match op {
+        InfixOp::Eq => compare("eq", lhs, rhs),
         InfixOp::Ne => parse::SingleExpression::bool_match(
-            jet("eq", vec![lhs, rhs]).into_expression(),
+            compare("eq", lhs, rhs),
             boolean(true),
             boolean(false),
             span,
-        ),
-        InfixOp::Lt => jet("lt", vec![lhs, rhs]),
-        InfixOp::Le => jet("le", vec![lhs, rhs]),
+        )
+        .into_expression(),
+        InfixOp::Lt => compare("lt", lhs, rhs),
+        InfixOp::Le => compare("le", lhs, rhs),
         // There are no greater-than jets, so `a > b` is `b < a`. This evaluates
         // `b` before `a`. Evaluation doesn't have side effects other than
         // failing, so the order only decides which failure is reported when
         // both operands fail.
-        InfixOp::Gt => jet("lt", vec![rhs, lhs]),
-        InfixOp::Ge => jet("le", vec![rhs, lhs]),
+        InfixOp::Gt => compare("lt", rhs, lhs),
+        InfixOp::Ge => compare("le", rhs, lhs),
         _ => unreachable!("`{op}` is not a comparison operator"),
-    })
+    };
+    Ok(parse::SingleExpression::from_expression(rewritten))
+}
+
+/// Compare operands of the given width with the jet `name`, which is `eq`, `lt`
+/// or `le`. Where that jet doesn't exist for the width, compare the halves:
+///
+/// - `a == b` is `a_high == b_high && a_low == b_low`.
+/// - `a < b` is `a_high < b_high || (a_high == b_high && a_low < b_low)`, and
+///   `a <= b` is the same with `a_low <= b_low`.
+fn comparison_jets(
+    name: &'static str,
+    lhs: parse::Expression,
+    rhs: parse::Expression,
+    width: usize,
+    span: Span,
+) -> parse::Expression {
+    let has_jet = match name {
+        "eq" => matches!(width, 1 | 8 | 16 | 32 | 64 | 256),
+        _ => matches!(width, 8 | 16 | 32 | 64),
+    };
+    if has_jet {
+        return parse::SingleExpression::jet_call(&format!("{name}_{width}"), vec![lhs, rhs], span)
+            .into_expression();
+    }
+
+    let half = width / 2;
+    let high = |name| {
+        comparison_jets(
+            name,
+            variable(LHS_HIGH, span),
+            variable(RHS_HIGH, span),
+            half,
+            span,
+        )
+    };
+    let low = |name| {
+        comparison_jets(
+            name,
+            variable(LHS_LOW, span),
+            variable(RHS_LOW, span),
+            half,
+            span,
+        )
+    };
+    let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
+
+    let result = if name == "eq" {
+        parse::SingleExpression::bool_match(high("eq"), boolean(false), low("eq"), span)
+    } else {
+        let high_equal_then_low =
+            parse::SingleExpression::bool_match(high("eq"), boolean(false), low(name), span)
+                .into_expression();
+        parse::SingleExpression::bool_match(high("lt"), high_equal_then_low, boolean(true), span)
+    };
+    with_halves(lhs, rhs, width, result.into_expression(), span)
+}
+
+/// Names of the halves of the operands inside [`with_halves`].
+const LHS_HIGH: &str = "lhs_high";
+const LHS_LOW: &str = "lhs_low";
+const RHS_HIGH: &str = "rhs_high";
+const RHS_LOW: &str = "rhs_low";
+
+/// Build a block that splits both operands, of the given width, into halves
+/// named [`LHS_HIGH`], [`LHS_LOW`], [`RHS_HIGH`] and [`RHS_LOW`], and ends in
+/// `body`:
+///
+/// ```text
+/// {
+///     let ((lhs_high, lhs_low), (rhs_high, rhs_low)): ((u64, u64), (u64, u64)) =
+///         <(u128, u128)>::into((lhs, rhs));
+///     body
+/// }
+/// ```
+///
+/// Both operands are evaluated before any name is bound, and `body` refers
+/// only to the halves, so the names can't capture any variable of the program.
+fn with_halves(
+    lhs: parse::Expression,
+    rhs: parse::Expression,
+    width: usize,
+    body: parse::Expression,
+    span: Span,
+) -> parse::Expression {
+    let name = |name| Pattern::Identifier(crate::str::Identifier::from_str_unchecked(name));
+    let pattern = Pattern::tuple([
+        Pattern::tuple([name(LHS_HIGH), name(LHS_LOW)]),
+        Pattern::tuple([name(RHS_HIGH), name(RHS_LOW)]),
+    ]);
+    let halves_ty = AliasedType::tuple([pair_type(uint(width / 2)), pair_type(uint(width / 2))]);
+    let operands = parse::SingleExpression::tuple(vec![lhs, rhs], span).into_expression();
+    let split = parse::SingleExpression::type_cast(pair_type(uint(width)), operands, span)
+        .into_expression();
+    let statement = parse::SingleExpression::assignment(pattern, halves_ty, split, span);
+    parse::SingleExpression::block(vec![statement], body, span)
+}
+
+/// The type `(ty, ty)`.
+fn pair_type(ty: UIntType) -> AliasedType {
+    AliasedType::tuple([AliasedType::from(ty), AliasedType::from(ty)])
+}
+
+/// The unsigned integer type of the given width.
+fn uint(width: usize) -> UIntType {
+    match width {
+        1 => UIntType::U1,
+        2 => UIntType::U2,
+        4 => UIntType::U4,
+        8 => UIntType::U8,
+        16 => UIntType::U16,
+        32 => UIntType::U32,
+        64 => UIntType::U64,
+        128 => UIntType::U128,
+        256 => UIntType::U256,
+        _ => unreachable!("there is no `u{width}`"),
+    }
+}
+
+/// A reference to the variable `name`.
+fn variable(name: &str, span: Span) -> parse::Expression {
+    parse::SingleExpression::variable(name, span).into_expression()
 }
 
 /// `<bool>::into(operand)`, which turns a boolean into the `u1` with the same

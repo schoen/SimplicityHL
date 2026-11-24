@@ -40,9 +40,9 @@ Operators on booleans and unsigned integers:
 
 | Operators | Operand types | Result type |
 | --- | --- | --- |
-| `==` `!=` | `bool`, `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64`, `u256` | `bool` |
-| `<` `<=` `>` `>=` | `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64` | `bool` |
-| `&` `\|` `^` | `bool`, `u1`, `u2`, `u4`, `u8`, `u16`, `u32`, `u64` | the operand type |
+| `==` `!=` | `bool` and every unsigned integer type | `bool` |
+| `<` `<=` `>` `>=` | every unsigned integer type | `bool` |
+| `&` `\|` `^` | `bool` and every unsigned integer type | the operand type |
 | `&&` `\|\|` | `bool` | `bool` |
 | `!` (prefix) | `bool` | `bool` |
 
@@ -54,8 +54,11 @@ fn is_in_range(x: u32, low: u32, high: u32) -> bool {
 }
 ```
 
-Each operator compiles to the corresponding jet, so `a < b` on `u8` values is the
-same as `jet::lt_8(a, b)`, and `a & b` is the same as `jet::and_8(a, b)`.
+Where a jet exists for the operator and type, the operator compiles to it, so
+`a < b` on `u8` values is the same as `jet::lt_8(a, b)`, and `a & b` is the same as
+`jet::and_8(a, b)`. For other types, the compiler builds the operation from the
+jets for a neighboring width: `u2` and `u4` values are extended to `u8`, and
+`u128` and `u256` values are split into halves.
 
 ### Precedence
 
