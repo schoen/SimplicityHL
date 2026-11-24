@@ -30,6 +30,27 @@ fn parenthesize(expression: Expression) -> Expression {
     }
 }
 
+/// Generate `witness::NAME` or `param::NAME`.
+///
+/// The kind of the expression and the kind of the name must agree, or the
+/// expression displays as the other kind.
+fn arbitrary_witness_or_parameter(
+    u: &mut arbitrary::Unstructured,
+) -> arbitrary::Result<SingleExpressionInner> {
+    use arbitrary::Arbitrary;
+
+    let name = TemplateProgramWitness::arbitrary(u)?;
+    if bool::arbitrary(u)? {
+        Ok(SingleExpressionInner::Witness(
+            TemplateProgramWitness::witness_from_str(name.as_str()),
+        ))
+    } else {
+        Ok(SingleExpressionInner::Parameter(
+            TemplateProgramWitness::parameter_from_str(name.as_str()),
+        ))
+    }
+}
+
 impl<'a> arbitrary::Arbitrary<'a> for UseDecl {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let visibility = Visibility::arbitrary(u)?;
@@ -269,7 +290,7 @@ impl crate::ArbitraryRec for SingleExpression {
                 2 => Decimal::arbitrary(u).map(S::Decimal),
                 3 => Hexadecimal::arbitrary(u).map(S::Hexadecimal),
                 4 => Identifier::arbitrary(u).map(S::Variable),
-                5 => TemplateProgramWitness::arbitrary(u).map(S::Witness),
+                5 => arbitrary_witness_or_parameter(u),
                 6 => Ok(S::Option(None)),
                 _ => unreachable!(),
             },
@@ -279,7 +300,7 @@ impl crate::ArbitraryRec for SingleExpression {
                 2 => Decimal::arbitrary(u).map(S::Decimal),
                 3 => Hexadecimal::arbitrary(u).map(S::Hexadecimal),
                 4 => Identifier::arbitrary(u).map(S::Variable),
-                5 => TemplateProgramWitness::arbitrary(u).map(S::Witness),
+                5 => arbitrary_witness_or_parameter(u),
                 6 => Ok(S::Option(None)),
                 7 => Expression::arbitrary_rec(u, new_budget)
                     .map(Arc::new)
