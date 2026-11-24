@@ -1,0 +1,19 @@
+/*
+ * PROOF OF WORK
+ *
+ * Anyone can spend the coins by finding a nonce whose SHA-256 hash, read as a
+ * 256-bit number, is at most a target. Each leading zero byte of the target
+ * makes finding a nonce 256 times harder.
+ *
+ * Requires `simc -Z infix_operators`.
+ */
+fn sha2(nonce: u64) -> u256 {
+    let hasher: Ctx8 = jet::sha_256_ctx_8_init();
+    let hasher: Ctx8 = jet::sha_256_ctx_8_add_8(hasher, nonce);
+    jet::sha_256_ctx_8_finalize(hasher)
+}
+
+fn main() {
+    let target: u256 = 0x00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+    assert!(sha2(witness::NONCE) <= target);
+}

@@ -1,0 +1,26 @@
+/*
+ * HASH LOCK WITH TIMEOUT
+ *
+ * Anyone who knows the preimage of a hash can spend the coins. After a block
+ * height, anyone can spend them.
+ *
+ * `||` evaluates its right operand only when its left operand is false, so
+ * after the timeout the program doesn't hash the preimage.
+ *
+ * Requires `simc -Z infix_operators`.
+ */
+fn sha2(string: u256) -> u256 {
+    let hasher: Ctx8 = jet::sha_256_ctx_8_init();
+    let hasher: Ctx8 = jet::sha_256_ctx_8_add_32(hasher, string);
+    jet::sha_256_ctx_8_finalize(hasher)
+}
+
+fn timed_out() -> bool {
+    let timeout: Height = 1000;
+    jet::tx_lock_height() >= timeout
+}
+
+fn main() {
+    let expected_hash: u256 = 0x66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925; // sha2([0x00; 32])
+    assert!(timed_out() || sha2(witness::PREIMAGE) == expected_hash);
+}
