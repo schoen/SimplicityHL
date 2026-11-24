@@ -119,7 +119,10 @@ impl CallTracker {
     ///
     /// Different function calls have different spans.
     ///
-    /// This holds true when the method is called on a real source file.
+    /// This holds true when the method is called on a real source file,
+    /// except for the jet calls that the compiler writes for an operator, which
+    /// all have the operator's span. They share one debug symbol, which shows
+    /// the operator expression.
     /// The precondition might be broken when this method is called on random input.
     pub fn track_call(&mut self, span: Span, name: TrackedCallName) {
         let cmr = self.next_id_cmr();
