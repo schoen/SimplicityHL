@@ -359,8 +359,11 @@ fn to_token<'src, const PRESERVE: bool>(
             Token::BinLiteral(Binary::from_str_unchecked(text.as_ref()))
         });
 
-    let macros =
-        choice((just("assert!"), just("panic!"), just("dbg!"), just("list!"))).map(Token::Macro);
+    // `list!=x` compares the variable `list`, so a macro name followed by `!=`
+    // is an identifier.
+    let macros = choice((just("assert!"), just("panic!"), just("dbg!"), just("list!")))
+        .then_ignore(just("=").not())
+        .map(Token::Macro);
 
     let keyword = text::ident().map(|s| match s {
         "pub" => Token::Pub,
@@ -886,6 +889,22 @@ mod original_lexer {
             ("a===b", vec![a(), Token::EqEq, Token::Eq, b()]),
             // `>=` is two tokens, which the parser joins when adjacent.
             ("a >= b", vec![a(), Token::RAngle, Token::Eq, b()]),
+            // Variables named like macros can be compared without spaces.
+            ("list!=b", vec![Token::Ident("list"), Token::BangEq, b()]),
+            (
+                "assert!=b",
+                vec![Token::Ident("assert"), Token::BangEq, b()],
+            ),
+            (
+                "assert!(!a)",
+                vec![
+                    Token::Macro("assert!"),
+                    Token::LParen,
+                    Token::Bang,
+                    a(),
+                    Token::RParen,
+                ],
+            ),
         ];
 
         for (input, expected) in cases {
