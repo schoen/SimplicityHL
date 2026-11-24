@@ -77,6 +77,16 @@ const CONSTRUCTS: &[Construct] = &[
         name: "parenthesized operators",
         build: |depth| wrap_expression(&"(0 == 0 || ".repeat(depth), &")".repeat(depth)),
     },
+    // `<` and `>` also delimit generic arguments and casts, so nest them inside
+    // parentheses and call arguments too.
+    Construct {
+        name: "parenthesized comparisons",
+        build: |depth| wrap_expression(&"(0 < ".repeat(depth), &")".repeat(depth)),
+    },
+    Construct {
+        name: "comparisons in calls",
+        build: |depth| wrap_expression(&"f(0 > ".repeat(depth), &")".repeat(depth)),
+    },
     // Types have their own recursive parser, and three ways to nest.
     Construct {
         name: "option types",

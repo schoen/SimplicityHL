@@ -1,5 +1,5 @@
 use crate::driver::MAIN_MODULE;
-use crate::error::{DiagnosticManager, Error};
+use crate::error::{DiagnosticManager, Error, Location};
 use crate::parse::{
     Expression, ExpressionInner, ParseFromStr, ParseFromStrWithErrors, Program,
     SingleExpressionInner,
@@ -200,4 +200,171 @@ fn syntax_errors_near_comparisons_are_reported() {
             "{input:?} must report an error"
         );
     }
+}
+
+#[test]
+fn greater_or_equal_needs_adjacent_characters() {
+    for input in ["a>=b", "a >=b", "a>= b", "a >= b"] {
+        assert_eq!(shape(&parse(input)), "(a >= b)", "for input {input:?}");
+    }
+    for input in ["a > = b", "a >/* c */= b", "a >\n= b"] {
+        let msg = grammar_error(input);
+        assert!(
+            msg.contains("`>=`"),
+            "unexpected error for {input:?}: {msg}"
+        );
+    }
+    // `<=` is a single token, so `< =` isn't `<=`.
+    assert!(Expression::parse_from_str("a < = b").is_err());
+}
+
+#[test]
+fn operators_next_to_other_syntax() {
+    let cases = [
+        // Prefix `!`.
+        ("!f(x)", "(!f(x))"),
+        ("!a && b", "((!a) && b)"),
+        ("!(a < b)", "(!(a < b))"),
+        ("!!!a", "(!(!(!a)))"),
+        // Macros.
+        ("dbg!(a < b) == c", "(dbg!(a < b) == c)"),
+        ("a == panic!()", "(a == panic!())"),
+        ("x!=y", "(x != y)"),
+        // Generic arguments.
+        ("fold::<f, 4>(l, 0) == 0", "(fold::<f, 4>(l, 0) == 0)"),
+        ("<u8>::into(a) >= b", "(<u8>::into(a) >= b)"),
+        // Comparisons inside delimited lists, where `<` and `>` must not be
+        // taken for angle brackets.
+        ("(a < b, c > d)", "(a < b, c > d)"),
+        ("[a < b, c > d]", "[a < b, c > d]"),
+        ("f(a < b, c > d)", "f(a < b, c > d)"),
+        ("f(a > b, c < d)", "f(a > b, c < d)"),
+        ("Some(a > b)", "Some(a > b)"),
+        // Parenthesized comparisons can be compared.
+        ("(a < b) == (c < d)", "((a < b) == (c < d))"),
+    ];
+
+    for (input, expected) in cases {
+        let expression = parse(input);
+        assert_eq!(shape(&expression), expected, "for input {input:?}");
+        let displayed = expression.to_string();
+        assert_eq!(
+            parse(&displayed),
+            expression,
+            "{input:?} displays as {displayed:?}, which parses differently"
+        );
+    }
+}
+
+#[test]
+fn mixed_comparisons_cannot_be_chained() {
+    for input in ["a < b > c", "a > b < c", "a >= b == c", "a != b <= c"] {
+        let msg = grammar_error(input);
+        assert!(
+            msg.contains("cannot be chained"),
+            "unexpected error for {input:?}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn macros_parse_next_to_operators() {
+    let input = "fn main() {\n    assert!(!x);\n    assert!(x!=y);\n    assert!(dbg!(a < b));\n}";
+    let mut diagnostics = DiagnosticManager::new();
+    let program = Program::parse_from_str_with_errors(
+        MAIN_MODULE,
+        input,
+        &UnstableFeatures::all(),
+        &mut diagnostics,
+    );
+    assert!(program.is_some(), "{input:?} should parse:\n{diagnostics}");
+}
+
+/// The spans of the errors that parsing `input` reports.
+fn error_spans(input: &str) -> Vec<(usize, usize)> {
+    let mut diagnostics = DiagnosticManager::new();
+    let program = Program::parse_from_str_with_errors(
+        MAIN_MODULE,
+        input,
+        &UnstableFeatures::all(),
+        &mut diagnostics,
+    );
+    assert!(program.is_none(), "{input:?} must be rejected");
+    diagnostics
+        .diagnostics()
+        .iter()
+        .filter_map(|diagnostic| match diagnostic.location() {
+            Location::Code(span) => Some((span.start, span.end)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn comparisons_recover_like_other_operators() {
+    // Each program has a syntax error near a comparison, and a later one in
+    // `let y u8 = 1;`. Error recovery must not treat `<` and `>` as brackets,
+    // so it must find the same errors as when the comparison is replaced by
+    // `^`, which has the same length.
+    for input in [
+        "fn main() {\n    let x u8 = match c { false => a < b, true => false, };\n    let y u8 = 1;\n}",
+        "fn main() {\n    let x u8 = { a > b };\n    let y u8 = 1;\n}",
+        "fn main() {\n    let x: bool = (a < , b);\n    let y u8 = 1;\n}",
+        "fn main() {\n    let x: bool = f(a > , b);\n    let y u8 = 1;\n}",
+        "fn f(a: u8) -> bool {\n    let x u8 = a < 3;\n    true\n}\nfn main() {\n    let y u8 = 1;\n}",
+    ] {
+        let twin = input.replace(" < ", " ^ ").replace(" > ", " ^ ");
+        assert_eq!(
+            error_spans(input),
+            error_spans(&twin),
+            "{input:?} reports errors at other places than {twin:?}"
+        );
+    }
+}
+
+/// Display operator expressions generated from fixed pseudo-random data, and
+/// check that each parses back to the same expression.
+///
+/// This stands in for the `display_parse_tree` fuzz target while that target
+/// is disabled.
+#[test]
+#[cfg(feature = "arbitrary")]
+fn generated_operator_expressions_display_as_they_parse() {
+    use miniscript::iter::TreeLike;
+
+    use crate::parse::ExprTree;
+    use crate::ArbitraryRec;
+
+    let mut state: u64 = 0x5eed;
+    let mut next_byte = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+
+    let mut tested = 0;
+    for _ in 0..2000 {
+        let data: Vec<u8> = (0..512).map(|_| next_byte()).collect();
+        let mut u = arbitrary::Unstructured::new(&data);
+        let Ok(expression) = Expression::arbitrary_rec(&mut u, 4) else {
+            continue;
+        };
+        let has_operator = ExprTree::Expression(&expression)
+            .pre_order_iter()
+            .any(|node| matches!(node, ExprTree::BinaryOp(..) | ExprTree::LogicalNot(..)));
+        if !has_operator {
+            continue;
+        }
+
+        let displayed = expression.to_string();
+        let reparsed = Expression::parse_from_str(&displayed)
+            .unwrap_or_else(|error| panic!("{displayed:?} doesn't parse: {error:?}"));
+        assert_eq!(reparsed, expression, "{displayed:?} parses differently");
+        tested += 1;
+    }
+    assert!(
+        tested >= 50,
+        "only {tested} generated expressions had operators"
+    );
 }
