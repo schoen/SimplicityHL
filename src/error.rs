@@ -916,6 +916,10 @@ pub enum Error {
         expected: ResolvedType,
         found: ResolvedType,
     },
+    OperatorUnsupportedType {
+        op: &'static str,
+        ty: ResolvedType,
+    },
     ExpressionNotConstant,
     IntegerOutOfBounds {
         ty: UIntType,
@@ -1166,6 +1170,10 @@ impl fmt::Display for Error {
             Error::ExpressionTypeMismatch { expected, found } => write!(
                 f,
                 "Expected expression of type `{expected}`, found type `{found}`"
+            ),
+            Error::OperatorUnsupportedType { op, ty } => write!(
+                f,
+                "Operator `{op}` cannot be applied to values of type `{ty}`"
             ),
             Error::ExpressionNotConstant => write!(
                 f,

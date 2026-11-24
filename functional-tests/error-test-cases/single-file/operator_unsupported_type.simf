@@ -1,0 +1,7 @@
+// error: OperatorUnsupportedType
+// flags: infix_operators
+fn main() {
+    let a: u128 = 1;
+    let b: u128 = 2;
+    let c: u128 = a & b;
+}

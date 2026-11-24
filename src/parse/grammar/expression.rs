@@ -315,14 +315,6 @@ impl SingleExpression {
         binary_level(and, just(Token::PipePipe).to(InfixOp::Or)).boxed()
     }
 
-    /// Wrap the single expression into an expression.
-    fn into_expression(self) -> Expression {
-        Expression {
-            span: self.span,
-            inner: ExpressionInner::Single(self),
-        }
-    }
-
     /// Build the infix operator expression `lhs op rhs`.
     fn binary(lhs: Self, op: InfixOp, rhs: Self) -> Self {
         let span = join_spans(lhs.span, rhs.span);

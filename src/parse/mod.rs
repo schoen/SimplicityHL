@@ -661,6 +661,72 @@ impl SingleExpression {
 
 impl_eq_hash!(SingleExpression; inner);
 
+/// Builders for expressions that the compiler writes itself, such as the
+/// rewriting of operators into jet calls and `match` expressions. Every node
+/// gets the given span, which is normally the span of the source construct
+/// being rewritten.
+impl SingleExpression {
+    /// Wrap the single expression into an expression.
+    pub(crate) fn into_expression(self) -> Expression {
+        Expression {
+            span: self.span,
+            inner: ExpressionInner::Single(self),
+        }
+    }
+
+    /// Build the boolean literal `value`.
+    pub(crate) fn boolean(value: bool, span: Span) -> Self {
+        Self {
+            inner: SingleExpressionInner::Boolean(value),
+            span,
+        }
+    }
+
+    /// Build `match scrutinee { false => if_false, true => if_true }`.
+    pub(crate) fn bool_match(
+        scrutinee: Expression,
+        if_false: Expression,
+        if_true: Expression,
+        span: Span,
+    ) -> Self {
+        let arm = |pattern, expression| MatchArm {
+            pattern,
+            expression: Arc::new(expression),
+            span,
+        };
+        Self {
+            inner: SingleExpressionInner::Match(Match {
+                scrutinee: Arc::new(scrutinee),
+                left: arm(MatchPattern::False, if_false),
+                right: arm(MatchPattern::True, if_true),
+                span,
+            }),
+            span,
+        }
+    }
+
+    /// Build the call `jet::name(args)`.
+    pub(crate) fn jet_call(name: &str, args: Vec<Expression>, span: Span) -> Self {
+        Self::call(CallName::Jet(JetName::from_str_unchecked(name)), args, span)
+    }
+
+    /// Build the cast `<source>::into(arg)`, where `source` is the type of `arg`.
+    pub(crate) fn type_cast(source: AliasedType, arg: Expression, span: Span) -> Self {
+        Self::call(CallName::TypeCast(source), vec![arg], span)
+    }
+
+    fn call(name: CallName, args: Vec<Expression>, span: Span) -> Self {
+        Self {
+            inner: SingleExpressionInner::Call(Call {
+                name,
+                args: Arc::from(args),
+                span,
+            }),
+            span,
+        }
+    }
+}
+
 impl_require_feature!(SingleExpression {recurse: inner; });
 
 /// The kind of single expression.

@@ -870,6 +870,13 @@ pub(crate) mod tests {
             }
         }
 
+        pub fn assert_run_failure(self) {
+            assert!(
+                self.run().is_err(),
+                "Expected the program to fail, but it succeeded"
+            );
+        }
+
         #[cfg(feature = "serde")]
         pub fn get_encoding_with_witness(self) -> (String, String) {
             let (program_bytes, witness_bytes) = self.program.redeem().to_vec_with_witness();
@@ -1125,6 +1132,137 @@ pub(crate) mod tests {
         TestCase::program_file_with_unstable("./examples/raw_hash.simf", UnstableFeatures::all())
             .with_witness_values(WitnessValues::default())
             .assert_run_success();
+    }
+
+    /// A function that fails when it is called, to observe which operands
+    /// an operator evaluates.
+    const BOOM: &str = "fn boom() -> bool {\n    assert!(false);\n    true\n}\n";
+
+    fn operator_test(main_body: &str) -> TestCase<CompiledProgram> {
+        let text = format!("{BOOM}\nfn main() {{\n{main_body}\n}}\n");
+        TestCase::program_text_with_unstable(Cow::Owned(text), UnstableFeatures::all())
+    }
+
+    fn operator_compile_error(main_body: &str) -> String {
+        let text = format!("fn main() {{\n{main_body}\n}}\n");
+        match TemplateAst::new_with_unstable(
+            text,
+            &UnstableFeatures::all(),
+            Box::new(ElementsJetHinter::new()),
+        ) {
+            Ok(_) => panic!("Accepted faulty program:\n{main_body}"),
+            Err(diagnostics) => diagnostics.to_string(),
+        }
+    }
+
+    #[test]
+    fn logical_operators() {
+        operator_test(
+            "    let t: bool = true;
+    let f: bool = false;
+    assert!(t && t);
+    assert!(!(t && f));
+    assert!(!(f && t));
+    assert!(!(f && f));
+    assert!(t || t);
+    assert!(t || f);
+    assert!(f || t);
+    assert!(!(f || f));
+    assert!(!f);
+    assert!(!!t);
+    assert!(t && !f || f);
+    let both: bool = t && t;
+    assert!(both);",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
+    fn logical_operators_short_circuit() {
+        operator_test(
+            "    assert!(!(false && boom()));
+    assert!(true || boom());",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+
+        // The same right-hand sides fail when they are evaluated.
+        operator_test("    assert!(true && boom());")
+            .with_witness_values(WitnessValues::default())
+            .assert_run_failure();
+        operator_test("    assert!(false || boom());")
+            .with_witness_values(WitnessValues::default())
+            .assert_run_failure();
+    }
+
+    #[test]
+    fn bitwise_operators_on_integers() {
+        operator_test(
+            "    let a: u8 = 0xca;
+    let b: u8 = 0xa6;
+    assert!(jet::eq_8(a & b, 0x82));
+    assert!(jet::eq_8(a | b, 0xee));
+    assert!(jet::eq_8(a ^ b, 0x6c));
+    let c: u64 = 0xf0f0f0f0f0f0f0f0;
+    let d: u64 = 0xff00ff00ff00ff00;
+    assert!(jet::eq_64(c & d, 0xf000f000f000f000));
+    assert!(jet::eq_64(c | d, 0xfff0fff0fff0fff0));
+    assert!(jet::eq_64(c ^ d, 0x0ff00ff00ff00ff0));
+    let e: u1 = 1;
+    assert!(jet::eq_1(e ^ e, 0));
+    assert!(jet::eq_1(e & e, 1));",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+    }
+
+    #[test]
+    fn bitwise_operators_on_booleans() {
+        operator_test(
+            "    let t: bool = true;
+    let f: bool = false;
+    assert!(t & t);
+    assert!(!(t & f));
+    assert!(t | f);
+    assert!(!(f | f));
+    assert!(t ^ f);
+    assert!(!(t ^ t));",
+        )
+        .with_witness_values(WitnessValues::default())
+        .assert_run_success();
+
+        // Unlike `&&`, `&` evaluates both operands.
+        operator_test("    assert!(!(false & boom()));")
+            .with_witness_values(WitnessValues::default())
+            .assert_run_failure();
+    }
+
+    #[test]
+    fn operator_type_errors() {
+        let error = operator_compile_error("    let x: u8 = true && false;");
+        assert!(
+            error.contains("Expected expression of type `u8`, found type `bool`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let x: u8 = !true;");
+        assert!(
+            error.contains("Expected expression of type `u8`, found type `bool`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let x: u128 = 1 | 2;");
+        assert!(
+            error.contains("Operator `|` cannot be applied to values of type `u128`"),
+            "Unexpected error: {error}"
+        );
+
+        let error = operator_compile_error("    let x: (u8, u8) = (1, 2) ^ (3, 4);");
+        assert!(
+            error.contains("Operator `^` cannot be applied to values of type `(u8, u8)`"),
+            "Unexpected error: {error}"
+        );
     }
 
     #[test]
