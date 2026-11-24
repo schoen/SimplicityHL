@@ -56,9 +56,10 @@ fn is_in_range(x: u32, low: u32, high: u32) -> bool {
 
 Where a jet exists for the operator and type, the operator compiles to it, so
 `a < b` on `u8` values is the same as `jet::lt_8(a, b)`, and `a & b` is the same as
-`jet::and_8(a, b)`. For other types, the compiler builds the operation from the
-jets for a neighboring width: `u2` and `u4` values are extended to `u8`, and
-`u128` and `u256` values are split into halves.
+`jet::and_8(a, b)`. For other types, the compiler builds the operation from
+other jets. For example, `u2` and `u4` values are extended to `u8`, `<` on
+`u128` and `u256` values subtracts them in 64-bit parts, and `!=` is the
+complement of `==`.
 
 ### Precedence
 
@@ -83,7 +84,8 @@ Write `>=` without a space between `>` and `=`.
 
 `&&` evaluates its right operand only if its left operand is `true`, and `||`
 only if its left operand is `false`. The other operators evaluate both operands,
-including `&`, `|` and `^` on booleans.
+including `&`, `|` and `^` on booleans. `>` and `>=` evaluate their right operand
+first, so `dbg!` in their operands prints the right operand's value first.
 
 ### Operand types
 

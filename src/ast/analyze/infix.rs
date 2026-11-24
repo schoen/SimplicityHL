@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Span, WithSpan};
 use crate::jet::target_type;
+use crate::num::Pow2Usize;
 use crate::parse::{self, InfixOp};
 use crate::pattern::Pattern;
 use crate::types::{AliasedType, ResolvedType, TypeConstructible, TypeDeconstructible, UIntType};
@@ -25,30 +26,28 @@ pub(super) fn analyze_binary(
     let span = *from.span();
     let lhs = from.lhs().clone();
     let rhs = from.rhs().clone();
-    let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
 
     let rewritten = match from.op() {
         // `a && b` is `match a { false => false, true => b }`, which doesn't
         // evaluate `b` when `a` is false.
         InfixOp::And => {
             expect_boolean(ty).with_span(from)?;
-            parse::SingleExpression::bool_match(lhs, boolean(false), rhs, span)
+            parse::SingleExpression::bool_match(lhs, boolean(false, span), rhs, span)
         }
         // `a || b` is `match a { false => b, true => true }`, which doesn't
         // evaluate `b` when `a` is true.
         InfixOp::Or => {
             expect_boolean(ty).with_span(from)?;
-            parse::SingleExpression::bool_match(lhs, rhs, boolean(true), span)
+            parse::SingleExpression::bool_match(lhs, rhs, boolean(true, span), span)
         }
-        op @ (InfixOp::BitAnd | InfixOp::BitOr | InfixOp::BitXor) => {
-            bitwise(op, lhs, rhs, ty, span).with_span(from)?
-        }
+        InfixOp::BitAnd => bitwise(BitwiseJet::And, lhs, rhs, ty, span).with_span(from)?,
+        InfixOp::BitOr => bitwise(BitwiseJet::Or, lhs, rhs, ty, span).with_span(from)?,
+        InfixOp::BitXor => bitwise(BitwiseJet::Xor, lhs, rhs, ty, span).with_span(from)?,
         op
         @ (InfixOp::Eq | InfixOp::Ne | InfixOp::Lt | InfixOp::Le | InfixOp::Gt | InfixOp::Ge) => {
             expect_boolean(ty).with_span(from)?;
-            let known: &Scope = scope;
-            let operand_ty = operand_type(&lhs, known)
-                .or_else(|| operand_type(&rhs, known))
+            let operand_ty = operand_type(&lhs, scope)
+                .or_else(|| operand_type(&rhs, scope))
                 .ok_or(Error::OperatorOperandTypeUnknown { op: op.as_str() })
                 .with_span(from)?;
             comparison(op, lhs, rhs, &operand_ty, span).with_span(from)?
@@ -60,7 +59,8 @@ pub(super) fn analyze_binary(
 
 /// Analyze `!operand`, which must be of type `ty`.
 ///
-/// `!a` is `match a { false => true, true => false }`.
+/// `!a` is `<u1>::into(jet::complement_1(<bool>::into(a)))`, which costs less
+/// than a `match`.
 pub(super) fn analyze_not(
     from: &parse::LogicalNot,
     ty: &ResolvedType,
@@ -69,13 +69,8 @@ pub(super) fn analyze_not(
     expect_boolean(ty).with_span(from)?;
 
     let span = *from.span();
-    let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
-    let rewritten = parse::SingleExpression::bool_match(
-        from.operand().clone(),
-        boolean(true),
-        boolean(false),
-        span,
-    );
+    let rewritten =
+        parse::SingleExpression::from_expression(negate(from.operand().clone(), span));
 
     analyze_rewritten(&rewritten, ty, scope)
 }
@@ -100,113 +95,157 @@ fn expect_boolean(ty: &ResolvedType) -> Result<(), Error> {
     }
 }
 
-/// Rewrite a bitwise operator into the jet for the width of `ty`, which is the
+/// The jets `and_N`, `or_N` and `xor_N` of a bitwise operator.
+#[derive(Clone, Copy)]
+enum BitwiseJet {
+    And,
+    Or,
+    Xor,
+}
+
+impl BitwiseJet {
+    /// The operator that the jets implement.
+    fn op(self) -> InfixOp {
+        match self {
+            Self::And => InfixOp::BitAnd,
+            Self::Or => InfixOp::BitOr,
+            Self::Xor => InfixOp::BitXor,
+        }
+    }
+
+    /// The name of the jet for operands of the given width, which is 1, 8,
+    /// 16, 32 or 64.
+    fn name(self, width: usize) -> String {
+        let family = match self {
+            Self::And => "and",
+            Self::Or => "or",
+            Self::Xor => "xor",
+        };
+        format!("{family}_{width}")
+    }
+}
+
+/// The jets `eq_N`, `lt_N` and `le_N` that comparisons are built from.
+#[derive(Clone, Copy)]
+enum CompareJet {
+    Eq,
+    Lt,
+    Le,
+}
+
+impl CompareJet {
+    /// Whether the jet exists for operands of the given width.
+    fn exists(self, width: usize) -> bool {
+        match self {
+            Self::Eq => matches!(width, 1 | 8 | 16 | 32 | 64 | 256),
+            Self::Lt | Self::Le => matches!(width, 8 | 16 | 32 | 64),
+        }
+    }
+
+    /// The name of the jet for operands of the given width.
+    fn name(self, width: usize) -> String {
+        let family = match self {
+            Self::Eq => "eq",
+            Self::Lt => "lt",
+            Self::Le => "le",
+        };
+        format!("{family}_{width}")
+    }
+}
+
+/// Rewrite a bitwise operator into jets for the width of `ty`, which is the
 /// type of both operands and of the result.
 fn bitwise(
-    op: InfixOp,
+    jet: BitwiseJet,
     lhs: parse::Expression,
     rhs: parse::Expression,
     ty: &ResolvedType,
     span: Span,
 ) -> Result<parse::SingleExpression, Error> {
-    let name = match op {
-        InfixOp::BitAnd => "and",
-        InfixOp::BitOr => "or",
-        InfixOp::BitXor => "xor",
-        _ => unreachable!("`{op}` is not a bitwise operator"),
-    };
-
     // A boolean has the same representation as a `u1`, so the `u1` jet works
     // on booleans after a cast in each direction:
     // `<u1>::into(jet::and_1(<bool>::into(a), <bool>::into(b)))`.
     if ty.is_boolean() {
-        let jet = parse::SingleExpression::jet_call(
-            &format!("{name}_1"),
+        let result = jet_call(
+            &jet.name(1),
             vec![bool_to_u1(lhs, span), bool_to_u1(rhs, span)],
             span,
         );
-        return Ok(parse::SingleExpression::type_cast(
-            AliasedType::from(UIntType::U1),
-            jet.into_expression(),
-            span,
-        ));
+        return Ok(parse::SingleExpression::from_expression(u1_to_bool(
+            result, span,
+        )));
     }
+
+    let Some(int) = ty.as_integer() else {
+        return Err(Error::OperatorUnsupportedType {
+            op: jet.op().as_str(),
+            ty: ty.clone(),
+        });
+    };
+    let width = int.bit_width().get();
 
     // There are no jets for `u2` and `u4`: use the `u8` jet on zero-extended
     // operands and keep the low bits of the result.
-    if let Some(small @ (UIntType::U2 | UIntType::U4)) = ty.as_integer() {
-        let small = small_width(small);
-        let wide = parse::SingleExpression::jet_call(
-            &format!("{name}_8"),
-            vec![
-                extend_to_u8(lhs, small, span),
-                extend_to_u8(rhs, small, span),
-            ],
+    if matches!(int, UIntType::U2 | UIntType::U4) {
+        let extended = parse::SingleExpression::jet_call(
+            &jet.name(8),
+            vec![extend_to_u8(lhs, int, span), extend_to_u8(rhs, int, span)],
             span,
         );
         return Ok(parse::SingleExpression::jet_call(
-            &format!("rightmost_8_{small}"),
-            vec![wide.into_expression()],
+            &format!("rightmost_8_{width}"),
+            vec![extended.into_expression()],
             span,
         ));
     }
 
-    let width = match ty.as_integer() {
-        Some(UIntType::U1) => 1,
-        Some(UIntType::U8) => 8,
-        Some(UIntType::U16) => 16,
-        Some(UIntType::U32) => 32,
-        Some(UIntType::U64) => 64,
-        Some(UIntType::U128) => 128,
-        Some(UIntType::U256) => 256,
-        _ => {
-            return Err(Error::OperatorUnsupportedType {
-                op: op.as_str(),
-                ty: ty.clone(),
-            })
-        }
-    };
     Ok(parse::SingleExpression::from_expression(bitwise_jets(
-        name, lhs, rhs, width, span,
+        jet, lhs, rhs, width, span,
     )))
 }
 
-/// Apply the bitwise jet `name` to operands of the given width. Above 64 bits,
-/// where there are no jets, apply it to the high halves and to the low halves.
+/// Apply the bitwise jet to operands of the given width. Above 64 bits,
+/// where there are no jets, split both operands into 64-bit limbs (see
+/// [`split_into_limbs`]), apply the jet to each pair of limbs, and join the
+/// results. For `a & b` on `u128`:
+///
+/// ```text
+/// {
+///     let ((lhs_1, lhs_0), (rhs_1, rhs_0)): ((u64, u64), (u64, u64)) =
+///         <(u128, u128)>::into((a, b));
+///     <(u64, u64)>::into((jet::and_64(lhs_1, rhs_1), jet::and_64(lhs_0, rhs_0)))
+/// }
+/// ```
 fn bitwise_jets(
-    name: &str,
+    jet: BitwiseJet,
     lhs: parse::Expression,
     rhs: parse::Expression,
     width: usize,
     span: Span,
 ) -> parse::Expression {
     if width <= 64 {
-        return parse::SingleExpression::jet_call(&format!("{name}_{width}"), vec![lhs, rhs], span)
-            .into_expression();
+        return jet_call(&jet.name(width), vec![lhs, rhs], span);
     }
 
-    let half = width / 2;
-    let high = bitwise_jets(
-        name,
-        variable(LHS_HIGH, span),
-        variable(RHS_HIGH, span),
-        half,
-        span,
-    );
-    let low = bitwise_jets(
-        name,
-        variable(LHS_LOW, span),
-        variable(RHS_LOW, span),
-        half,
-        span,
-    );
-    let halves = parse::SingleExpression::tuple(vec![high, low], span).into_expression();
+    let (split, lhs_limbs, rhs_limbs) = split_into_limbs(lhs, rhs, width, span);
+    let results = lhs_limbs
+        .iter()
+        .zip(&rhs_limbs)
+        .map(|(lhs, rhs)| {
+            jet_call(
+                &jet.name(64),
+                vec![variable(lhs, span), variable(rhs, span)],
+                span,
+            )
+        })
+        .collect();
     let joined =
-        parse::SingleExpression::type_cast(pair_type(uint(half)), halves, span).into_expression();
-    with_halves(lhs, rhs, width, joined, span)
+        parse::SingleExpression::type_cast(limbs_type(width), limbs_tuple(results, span), span)
+            .into_expression();
+    parse::SingleExpression::block(vec![split], joined, span)
 }
 
-/// Rewrite a comparison of two operands of type `operand_ty` into a jet call.
+/// Rewrite a comparison of two operands of type `operand_ty` into jet calls.
 fn comparison(
     op: InfixOp,
     lhs: parse::Expression,
@@ -219,157 +258,225 @@ fn comparison(
         ty: operand_ty.clone(),
     };
 
-    let is_ordering = !matches!(op, InfixOp::Eq | InfixOp::Ne);
-
     let (width, lhs, rhs) = if operand_ty.is_boolean() {
         // Booleans compare as `u1`, which has the same representation.
-        if is_ordering {
+        if !matches!(op, InfixOp::Eq | InfixOp::Ne) {
             return Err(unsupported());
         }
         (1, bool_to_u1(lhs, span), bool_to_u1(rhs, span))
     } else {
-        match operand_ty.as_integer() {
-            // There are no jets for `u2` and `u4`, nor ordering jets for `u1`:
-            // compare the operands zero-extended to `u8`.
-            Some(small @ (UIntType::U2 | UIntType::U4)) => {
-                let small = small_width(small);
-                (
-                    8,
-                    extend_to_u8(lhs, small, span),
-                    extend_to_u8(rhs, small, span),
-                )
-            }
-            Some(UIntType::U1) if is_ordering => {
-                (8, extend_to_u8(lhs, 1, span), extend_to_u8(rhs, 1, span))
-            }
-            Some(UIntType::U1) => (1, lhs, rhs),
-            Some(UIntType::U8) => (8, lhs, rhs),
-            Some(UIntType::U16) => (16, lhs, rhs),
-            Some(UIntType::U32) => (32, lhs, rhs),
-            Some(UIntType::U64) => (64, lhs, rhs),
-            Some(UIntType::U128) => (128, lhs, rhs),
-            Some(UIntType::U256) => (256, lhs, rhs),
-            _ => return Err(unsupported()),
+        let int = operand_ty.as_integer().ok_or_else(unsupported)?;
+        if matches!(int, UIntType::U2 | UIntType::U4) {
+            // There are no jets for `u2` and `u4`: compare the operands
+            // zero-extended to `u8`.
+            (
+                8,
+                extend_to_u8(lhs, int, span),
+                extend_to_u8(rhs, int, span),
+            )
+        } else {
+            (int.bit_width().get(), lhs, rhs)
         }
     };
 
-    let compare = |name, lhs, rhs| comparison_jets(name, lhs, rhs, width, span);
-    let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
+    let compare = |jet, lhs, rhs| comparison_jets(jet, lhs, rhs, width, span);
 
     let rewritten = match op {
-        InfixOp::Eq => compare("eq", lhs, rhs),
-        InfixOp::Ne => parse::SingleExpression::bool_match(
-            compare("eq", lhs, rhs),
-            boolean(true),
-            boolean(false),
-            span,
-        )
-        .into_expression(),
-        InfixOp::Lt => compare("lt", lhs, rhs),
-        InfixOp::Le => compare("le", lhs, rhs),
+        InfixOp::Eq => compare(CompareJet::Eq, lhs, rhs),
+        InfixOp::Ne => negate(compare(CompareJet::Eq, lhs, rhs), span),
+        InfixOp::Lt => compare(CompareJet::Lt, lhs, rhs),
+        InfixOp::Le => compare(CompareJet::Le, lhs, rhs),
         // There are no greater-than jets, so `a > b` is `b < a`. This evaluates
         // `b` before `a`. Evaluation doesn't have side effects other than
-        // failing, so the order only decides which failure is reported when
-        // both operands fail.
-        InfixOp::Gt => compare("lt", rhs, lhs),
-        InfixOp::Ge => compare("le", rhs, lhs),
-        _ => unreachable!("`{op}` is not a comparison operator"),
+        // failing and the output of `dbg!`, so the order only decides which
+        // failure is reported when both operands fail, and the order of the
+        // output of `dbg!` in the operands.
+        InfixOp::Gt => compare(CompareJet::Lt, rhs, lhs),
+        InfixOp::Ge => compare(CompareJet::Le, rhs, lhs),
+        InfixOp::BitAnd | InfixOp::BitOr | InfixOp::BitXor | InfixOp::And | InfixOp::Or => {
+            unreachable!("`{op}` is not a comparison operator")
+        }
     };
     Ok(parse::SingleExpression::from_expression(rewritten))
 }
 
-/// Compare operands of the given width with the jet `name`, which is `eq`, `lt`
-/// or `le`. Where that jet doesn't exist for the width, compare the halves:
+/// Compare operands of the given width, which is 1, 8, 16, 32, 64, 128 or
+/// 256, with the jet, or where the jet doesn't exist for the width, with
+/// other jets:
 ///
-/// - `a == b` is `a_high == b_high && a_low == b_low`.
-/// - `a < b` is `a_high < b_high || (a_high == b_high && a_low < b_low)`, and
-///   `a <= b` is the same with `a_low <= b_low`.
+/// - On `u1`, `a < b` is `!a & b`, and `a <= b` is `!a | b`.
+/// - On `u128`, `a == b` compares the operands zero-extended to `u256`.
+/// - On `u128` and `u256`, `a < b` and `a <= b` come from a subtraction
+///   (see [`borrow_chain`]).
 fn comparison_jets(
-    name: &'static str,
+    jet: CompareJet,
     lhs: parse::Expression,
     rhs: parse::Expression,
     width: usize,
     span: Span,
 ) -> parse::Expression {
-    let has_jet = match name {
-        "eq" => matches!(width, 1 | 8 | 16 | 32 | 64 | 256),
-        _ => matches!(width, 8 | 16 | 32 | 64),
-    };
-    if has_jet {
-        return parse::SingleExpression::jet_call(&format!("{name}_{width}"), vec![lhs, rhs], span)
-            .into_expression();
+    if jet.exists(width) {
+        return jet_call(&jet.name(width), vec![lhs, rhs], span);
     }
 
-    let half = width / 2;
-    let high = |name| {
-        comparison_jets(
-            name,
-            variable(LHS_HIGH, span),
-            variable(RHS_HIGH, span),
-            half,
-            span,
-        )
-    };
-    let low = |name| {
-        comparison_jets(
-            name,
-            variable(LHS_LOW, span),
-            variable(RHS_LOW, span),
-            half,
-            span,
-        )
-    };
-    let boolean = |value| parse::SingleExpression::boolean(value, span).into_expression();
-
-    let result = if name == "eq" {
-        parse::SingleExpression::bool_match(high("eq"), boolean(false), low("eq"), span)
-    } else {
-        let high_equal_then_low =
-            parse::SingleExpression::bool_match(high("eq"), boolean(false), low(name), span)
-                .into_expression();
-        parse::SingleExpression::bool_match(high("lt"), high_equal_then_low, boolean(true), span)
-    };
-    with_halves(lhs, rhs, width, result.into_expression(), span)
+    match (jet, width) {
+        (CompareJet::Eq, 128) => {
+            let extend = |operand| {
+                let zero = parse::SingleExpression::decimal("0", span).into_expression();
+                let pair = parse::SingleExpression::tuple(vec![zero, operand], span);
+                parse::SingleExpression::type_cast(
+                    pair_type(UIntType::U128),
+                    pair.into_expression(),
+                    span,
+                )
+                .into_expression()
+            };
+            jet_call("eq_256", vec![extend(lhs), extend(rhs)], span)
+        }
+        (CompareJet::Lt | CompareJet::Le, 1) => {
+            let combine = match jet {
+                CompareJet::Lt => "and_1",
+                _ => "or_1",
+            };
+            let not_lhs = jet_call("complement_1", vec![lhs], span);
+            u1_to_bool(jet_call(combine, vec![not_lhs, rhs], span), span)
+        }
+        (CompareJet::Lt, 128 | 256) => borrow_chain(lhs, rhs, width, false, span),
+        (CompareJet::Le, 128 | 256) => borrow_chain(lhs, rhs, width, true, span),
+        _ => unreachable!("there is no lowering for `{}`", jet.name(width)),
+    }
 }
 
-/// Names of the halves of the operands inside [`with_halves`].
-const LHS_HIGH: &str = "lhs_high";
-const LHS_LOW: &str = "lhs_low";
-const RHS_HIGH: &str = "rhs_high";
-const RHS_LOW: &str = "rhs_low";
+/// Name of the borrow inside [`borrow_chain`].
+const BORROW: &str = "borrow";
 
-/// Build a block that splits both operands, of the given width, into halves
-/// named [`LHS_HIGH`], [`LHS_LOW`], [`RHS_HIGH`] and [`RHS_LOW`], and ends in
-/// `body`:
+/// Build a block that computes `a < b`, or with `or_equal`, `a <= b`, for
+/// operands of 128 or 256 bits. It splits both operands into 64-bit limbs,
+/// and subtracts them from the least significant limb up, passing on the
+/// borrow. `a < b` exactly when `a - b` borrows, and `a <= b` exactly when
+/// `b - a` doesn't. For `a < b` on `u128`:
 ///
 /// ```text
 /// {
-///     let ((lhs_high, lhs_low), (rhs_high, rhs_low)): ((u64, u64), (u64, u64)) =
-///         <(u128, u128)>::into((lhs, rhs));
-///     body
+///     let ((lhs_1, lhs_0), (rhs_1, rhs_0)): ((u64, u64), (u64, u64)) =
+///         <(u128, u128)>::into((a, b));
+///     let (borrow, _): (bool, u64) = jet::subtract_64(lhs_0, rhs_0);
+///     let (borrow, _): (bool, u64) = jet::full_subtract_64(borrow, lhs_1, rhs_1);
+///     borrow
 /// }
 /// ```
 ///
-/// Both operands are evaluated before any name is bound, and `body` refers
-/// only to the halves, so the names can't capture any variable of the program.
-fn with_halves(
+/// The names can't capture any variable of the program (see
+/// [`split_into_limbs`]).
+fn borrow_chain(
     lhs: parse::Expression,
     rhs: parse::Expression,
     width: usize,
-    body: parse::Expression,
+    or_equal: bool,
     span: Span,
 ) -> parse::Expression {
-    let name = |name| Pattern::Identifier(crate::str::Identifier::from_str_unchecked(name));
-    let pattern = Pattern::tuple([
-        Pattern::tuple([name(LHS_HIGH), name(LHS_LOW)]),
-        Pattern::tuple([name(RHS_HIGH), name(RHS_LOW)]),
-    ]);
-    let halves_ty = AliasedType::tuple([pair_type(uint(width / 2)), pair_type(uint(width / 2))]);
+    let (split, lhs_limbs, rhs_limbs) = split_into_limbs(lhs, rhs, width, span);
+    let mut statements = vec![split];
+
+    let (minuend, subtrahend) = if or_equal {
+        (&rhs_limbs, &lhs_limbs)
+    } else {
+        (&lhs_limbs, &rhs_limbs)
+    };
+    for (i, (minuend, subtrahend)) in minuend.iter().zip(subtrahend).enumerate() {
+        let limb_args = [variable(minuend, span), variable(subtrahend, span)];
+        let subtraction = if i == 0 {
+            jet_call("subtract_64", Vec::from(limb_args), span)
+        } else {
+            let mut args = vec![variable(BORROW, span)];
+            args.extend(limb_args);
+            jet_call("full_subtract_64", args, span)
+        };
+        statements.push(parse::SingleExpression::assignment(
+            Pattern::tuple([identifier_pattern(BORROW), Pattern::Ignore]),
+            AliasedType::tuple([AliasedType::boolean(), AliasedType::from(UIntType::U64)]),
+            subtraction,
+            span,
+        ));
+    }
+
+    let borrow = variable(BORROW, span);
+    let result = if or_equal {
+        negate(borrow, span)
+    } else {
+        borrow
+    };
+    parse::SingleExpression::block(statements, result, span)
+}
+
+/// Build the statement that splits both operands, of 128 or 256 bits, into
+/// 64-bit limbs, and return it with the names of the limbs of each operand,
+/// the least significant first:
+///
+/// ```text
+/// let ((lhs_1, lhs_0), (rhs_1, rhs_0)): ((u64, u64), (u64, u64)) =
+///     <(u128, u128)>::into((a, b));
+/// ```
+///
+/// Both operands are evaluated, in order, before any name is bound. Code
+/// after the statement that refers only to the limbs, and to names it binds
+/// itself, can't capture any variable of the program.
+fn split_into_limbs(
+    lhs: parse::Expression,
+    rhs: parse::Expression,
+    width: usize,
+    span: Span,
+) -> (parse::Statement, Vec<String>, Vec<String>) {
+    let names = |side: &str| -> Vec<String> {
+        (0..width / 64).map(|i| format!("{side}_{i}")).collect()
+    };
+    let lhs_limbs = names("lhs");
+    let rhs_limbs = names("rhs");
+
+    let ty = AliasedType::tuple([limbs_type(width), limbs_type(width)]);
+    let pattern = Pattern::tuple([limbs_pattern(&lhs_limbs), limbs_pattern(&rhs_limbs)]);
     let operands = parse::SingleExpression::tuple(vec![lhs, rhs], span).into_expression();
     let split = parse::SingleExpression::type_cast(pair_type(uint(width)), operands, span)
         .into_expression();
-    let statement = parse::SingleExpression::assignment(pattern, halves_ty, split, span);
-    parse::SingleExpression::block(vec![statement], body, span)
+    let statement = parse::SingleExpression::assignment(pattern, ty, split, span);
+    (statement, lhs_limbs, rhs_limbs)
+}
+
+/// The value of [`limbs_type`] made of `limbs`, which are listed the least
+/// significant first.
+fn limbs_tuple(mut limbs: Vec<parse::Expression>, span: Span) -> parse::Expression {
+    if limbs.len() == 1 {
+        return limbs.pop().expect("there is one limb");
+    }
+    let high = limbs.split_off(limbs.len() / 2);
+    parse::SingleExpression::tuple(
+        vec![limbs_tuple(high, span), limbs_tuple(limbs, span)],
+        span,
+    )
+    .into_expression()
+}
+
+/// The type of an integer of the given width as 64-bit limbs: `u64`,
+/// `(u64, u64)` or `((u64, u64), (u64, u64))`.
+fn limbs_type(width: usize) -> AliasedType {
+    if width == 64 {
+        AliasedType::from(UIntType::U64)
+    } else {
+        let half = limbs_type(width / 2);
+        AliasedType::tuple([half.clone(), half])
+    }
+}
+
+/// The pattern that binds the limbs of [`limbs_type`] to `names`, which are
+/// listed the least significant first.
+fn limbs_pattern(names: &[String]) -> Pattern {
+    match names {
+        [name] => identifier_pattern(name),
+        _ => {
+            let (low, high) = names.split_at(names.len() / 2);
+            Pattern::tuple([limbs_pattern(high), limbs_pattern(low)])
+        }
+    }
 }
 
 /// The type `(ty, ty)`.
@@ -379,18 +486,38 @@ fn pair_type(ty: UIntType) -> AliasedType {
 
 /// The unsigned integer type of the given width.
 fn uint(width: usize) -> UIntType {
-    match width {
-        1 => UIntType::U1,
-        2 => UIntType::U2,
-        4 => UIntType::U4,
-        8 => UIntType::U8,
-        16 => UIntType::U16,
-        32 => UIntType::U32,
-        64 => UIntType::U64,
-        128 => UIntType::U128,
-        256 => UIntType::U256,
-        _ => unreachable!("there is no `u{width}`"),
-    }
+    Pow2Usize::new(width)
+        .and_then(UIntType::from_bit_width)
+        .unwrap_or_else(|| unreachable!("there is no `u{width}`"))
+}
+
+/// The boolean literal `value`.
+fn boolean(value: bool, span: Span) -> parse::Expression {
+    parse::SingleExpression::boolean(value, span).into_expression()
+}
+
+/// The pattern that binds a value to the variable `name`.
+fn identifier_pattern(name: &str) -> Pattern {
+    Pattern::Identifier(crate::str::Identifier::from_str_unchecked(name))
+}
+
+/// The jet call `jet::name(args)`.
+fn jet_call(name: &str, args: Vec<parse::Expression>, span: Span) -> parse::Expression {
+    parse::SingleExpression::jet_call(name, args, span).into_expression()
+}
+
+/// `!operand` for a boolean expression, with the `u1` jet:
+/// `<u1>::into(jet::complement_1(<bool>::into(operand)))`.
+fn negate(operand: parse::Expression, span: Span) -> parse::Expression {
+    let complement = jet_call("complement_1", vec![bool_to_u1(operand, span)], span);
+    u1_to_bool(complement, span)
+}
+
+/// `<u1>::into(operand)`, which turns a `u1` into the boolean with the same
+/// representation.
+fn u1_to_bool(operand: parse::Expression, span: Span) -> parse::Expression {
+    parse::SingleExpression::type_cast(AliasedType::from(UIntType::U1), operand, span)
+        .into_expression()
 }
 
 /// A reference to the variable `name`.
@@ -447,37 +574,17 @@ fn operand_type(expression: &parse::Expression, scope: &Scope) -> Option<Resolve
     }
 }
 
-/// The width of `u1`, `u2` or `u4`.
-fn small_width(ty: UIntType) -> usize {
-    match ty {
-        UIntType::U1 => 1,
-        UIntType::U2 => 2,
-        UIntType::U4 => 4,
-        _ => unreachable!("`{ty}` is not narrower than `u8`"),
-    }
-}
-
-/// Zero-extend a `u1`, `u2` or `u4` operand of the given width to `u8`, one
+/// Zero-extend a `u1`, `u2` or `u4` operand of type `ty` to `u8`, one
 /// doubling at a time. `<(u4, u4)>::into((0, x))` is the `u8` whose high half
 /// is zero and whose low half is `x`.
-fn extend_to_u8(operand: parse::Expression, width: usize, span: Span) -> parse::Expression {
+fn extend_to_u8(operand: parse::Expression, ty: UIntType, span: Span) -> parse::Expression {
     let mut extended = operand;
-    let mut width = width;
+    let mut width = ty.bit_width().get();
     while width < 8 {
-        let half = AliasedType::from(match width {
-            1 => UIntType::U1,
-            2 => UIntType::U2,
-            4 => UIntType::U4,
-            _ => unreachable!("width {width} is not 1, 2 or 4"),
-        });
         let zero = parse::SingleExpression::decimal("0", span).into_expression();
         let pair = parse::SingleExpression::tuple(vec![zero, extended], span).into_expression();
-        extended = parse::SingleExpression::type_cast(
-            AliasedType::tuple([half.clone(), half]),
-            pair,
-            span,
-        )
-        .into_expression();
+        extended = parse::SingleExpression::type_cast(pair_type(uint(width)), pair, span)
+            .into_expression();
         width *= 2;
     }
     extended
