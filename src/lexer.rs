@@ -52,6 +52,30 @@ pub enum Token<'src> {
     LAngle,
     RAngle,
 
+    // Operators
+    //
+    // There is deliberately no `>=` token: in `let x: Option<u8>= None;` the
+    // `>` closes a type, so the lexer emits `>` and `=` separately and the
+    // expression parser joins them into `>=` when they are adjacent.
+    /// `==`
+    EqEq,
+    /// `!=`
+    BangEq,
+    /// `<=`
+    LtEq,
+    /// `&&`
+    AmpAmp,
+    /// `||`
+    PipePipe,
+    /// `&`
+    Amp,
+    /// `|`
+    Pipe,
+    /// `^`
+    Caret,
+    /// `!`
+    Bang,
+
     // Number literals
     DecLiteral(Decimal),
     HexLiteral(Hexadecimal),
@@ -178,6 +202,16 @@ impl<'src> fmt::Display for Token<'src> {
             Token::RBrace => write!(f, "}}"),
             Token::LAngle => write!(f, "<"),
             Token::RAngle => write!(f, ">"),
+
+            Token::EqEq => write!(f, "=="),
+            Token::BangEq => write!(f, "!="),
+            Token::LtEq => write!(f, "<="),
+            Token::AmpAmp => write!(f, "&&"),
+            Token::PipePipe => write!(f, "||"),
+            Token::Amp => write!(f, "&"),
+            Token::Pipe => write!(f, "|"),
+            Token::Caret => write!(f, "^"),
+            Token::Bang => write!(f, "!"),
 
             Token::DecLiteral(s) => write!(f, "{}", s),
             Token::HexLiteral(s) => write!(f, "0x{}", s),
@@ -359,22 +393,37 @@ fn to_token<'src, const PRESERVE: bool>(
         .ignore_then(text::ident())
         .map(Token::Param);
 
+    // Within each `choice`, a symbol must come before any shorter symbol that
+    // is its prefix (`==` before `=`, `<=` before `<`, and so on).
     let op = choice((
-        just("->").to(Token::Arrow),
-        just("=>").to(Token::FatArrow),
-        just("=").to(Token::Eq),
-        just("::").to(Token::DoubleColon),
-        just(":").to(Token::Colon),
-        just(";").to(Token::Semi),
-        just(",").to(Token::Comma),
-        just("(").to(Token::LParen),
-        just(")").to(Token::RParen),
-        just("[").to(Token::LBracket),
-        just("]").to(Token::RBracket),
-        just("{").to(Token::LBrace),
-        just("}").to(Token::RBrace),
-        just("<").to(Token::LAngle),
-        just(">").to(Token::RAngle),
+        choice((
+            just("->").to(Token::Arrow),
+            just("=>").to(Token::FatArrow),
+            just("==").to(Token::EqEq),
+            just("=").to(Token::Eq),
+            just("::").to(Token::DoubleColon),
+            just(":").to(Token::Colon),
+            just(";").to(Token::Semi),
+            just(",").to(Token::Comma),
+            just("(").to(Token::LParen),
+            just(")").to(Token::RParen),
+            just("[").to(Token::LBracket),
+            just("]").to(Token::RBracket),
+            just("{").to(Token::LBrace),
+            just("}").to(Token::RBrace),
+        )),
+        choice((
+            just("<=").to(Token::LtEq),
+            just("<").to(Token::LAngle),
+            just(">").to(Token::RAngle),
+            just("!=").to(Token::BangEq),
+            just("!").to(Token::Bang),
+            just("&&").to(Token::AmpAmp),
+            just("&").to(Token::Amp),
+            just("||").to(Token::PipePipe),
+            just("|").to(Token::Pipe),
+            just("^").to(Token::Caret),
+        )),
     ));
 
     choice((jet, witness, param, macros, hex, bin, num, keyword, op))
@@ -808,6 +857,130 @@ mod original_lexer {
         let _ = tokens.unwrap();
 
         assert!(lex_errs.is_empty());
+    }
+
+    #[test]
+    fn infix_operator_tokens() {
+        let a = || Token::Ident("a");
+        let b = || Token::Ident("b");
+        let cases = [
+            ("a == b", vec![a(), Token::EqEq, b()]),
+            ("a != b", vec![a(), Token::BangEq, b()]),
+            ("a < b", vec![a(), Token::LAngle, b()]),
+            ("a <= b", vec![a(), Token::LtEq, b()]),
+            ("a > b", vec![a(), Token::RAngle, b()]),
+            ("a && b", vec![a(), Token::AmpAmp, b()]),
+            ("a || b", vec![a(), Token::PipePipe, b()]),
+            ("a & b", vec![a(), Token::Amp, b()]),
+            ("a | b", vec![a(), Token::Pipe, b()]),
+            ("a ^ b", vec![a(), Token::Caret, b()]),
+            ("!a", vec![Token::Bang, a()]),
+            // Without spaces, the longest symbol wins.
+            ("a==b", vec![a(), Token::EqEq, b()]),
+            ("a!=b", vec![a(), Token::BangEq, b()]),
+            ("a<=b", vec![a(), Token::LtEq, b()]),
+            ("a&&b", vec![a(), Token::AmpAmp, b()]),
+            ("a||b", vec![a(), Token::PipePipe, b()]),
+            ("!!a", vec![Token::Bang, Token::Bang, a()]),
+            ("a&&&b", vec![a(), Token::AmpAmp, Token::Amp, b()]),
+            ("a===b", vec![a(), Token::EqEq, Token::Eq, b()]),
+            // `>=` is two tokens, which the parser joins when adjacent.
+            ("a >= b", vec![a(), Token::RAngle, Token::Eq, b()]),
+        ];
+
+        for (input, expected) in cases {
+            let (tokens, errors) = lex(input);
+            assert!(
+                errors.is_empty(),
+                "Expected no errors for {input:?}: {errors:?}"
+            );
+            assert_eq!(tokens, Some(expected), "Unexpected tokens for {input:?}");
+        }
+    }
+
+    #[test]
+    fn existing_symbols_unchanged_by_infix_operators() {
+        let cases = [
+            (
+                "fn f() -> u8",
+                vec![
+                    Token::Fn,
+                    Token::Ident("f"),
+                    Token::LParen,
+                    Token::RParen,
+                    Token::Arrow,
+                    Token::Ident("u8"),
+                ],
+            ),
+            (
+                "true => x",
+                vec![Token::Bool(true), Token::FatArrow, Token::Ident("x")],
+            ),
+            (
+                "let x = y;",
+                vec![
+                    Token::Let,
+                    Token::Ident("x"),
+                    Token::Eq,
+                    Token::Ident("y"),
+                    Token::Semi,
+                ],
+            ),
+            // A type's closing `>` directly followed by `=` must stay `>` then `=`.
+            (
+                "let x: Option<u8>= None;",
+                vec![
+                    Token::Let,
+                    Token::Ident("x"),
+                    Token::Colon,
+                    Token::Ident("Option"),
+                    Token::LAngle,
+                    Token::Ident("u8"),
+                    Token::RAngle,
+                    Token::Eq,
+                    Token::Ident("None"),
+                    Token::Semi,
+                ],
+            ),
+            (
+                "assert!(x)",
+                vec![
+                    Token::Macro("assert!"),
+                    Token::LParen,
+                    Token::Ident("x"),
+                    Token::RParen,
+                ],
+            ),
+            // Comments still take priority over operator characters.
+            ("a // b && c", vec![Token::Ident("a")]),
+            (
+                "a /* b || c */ d",
+                vec![Token::Ident("a"), Token::Ident("d")],
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let (tokens, errors) = lex(input);
+            assert!(
+                errors.is_empty(),
+                "Expected no errors for {input:?}: {errors:?}"
+            );
+            assert_eq!(tokens, Some(expected), "Unexpected tokens for {input:?}");
+        }
+    }
+
+    #[test]
+    fn infix_operator_tokens_display_as_source() {
+        let input = "a == b != c <= d < e > f && g || h & i | j ^ !k";
+        let (tokens, errors) = lex(input);
+        assert!(errors.is_empty(), "Expected no errors, found: {errors:?}");
+        let rendered = tokens
+            .expect("lexing succeeds")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rendered, "a == b != c <= d < e > f && g || h & i | j ^ ! k");
     }
 }
 
