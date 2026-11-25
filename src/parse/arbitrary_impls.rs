@@ -10,7 +10,7 @@ use crate::TemplateProgramWitness;
 
 use super::{
     Assignment, BinaryOp, Call, CallName, EnumDeclaration, EnumVariant, Expression,
-    ExpressionInner, Function, FunctionParam, InfixOp, Item, LogicalNot, Match, MatchArm,
+    ExpressionInner, Function, FunctionParam, InfixOp, Item, Not, Match, MatchArm,
     MatchPattern, Module, Program, SingleExpression, SingleExpressionInner, Statement, TypeAlias,
     UseDecl, UseItems, Visibility,
 };
@@ -354,7 +354,7 @@ impl crate::ArbitraryRec for SingleExpression {
                 17 => Expression::arbitrary_rec(u, new_budget)
                     .map(parenthesize)
                     .map(|operand| {
-                        S::LogicalNot(LogicalNot {
+                        S::Not(Not {
                             operand: Arc::new(operand),
                             span: Span::DUMMY,
                         })

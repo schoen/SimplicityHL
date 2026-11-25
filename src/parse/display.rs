@@ -253,7 +253,7 @@ impl fmt::Display for ExprTree<'_> {
                     | S::EnumMatch(..)
                     | S::EnumConstruction(..)
                     | S::BinaryOp(..)
-                    | S::LogicalNot(..) => {}
+                    | S::Not(..) => {}
                     S::Tuple(tuple) => {
                         if data.n_children_yielded == 0 {
                             write!(f, "(")?;
@@ -332,7 +332,7 @@ impl fmt::Display for ExprTree<'_> {
                     1 => write!(f, " {} ", binary_op.op())?,
                     n => debug_assert_eq!(n, 2),
                 },
-                Self::LogicalNot(..) => {
+                Self::Not(..) => {
                     if data.n_children_yielded == 0 {
                         write!(f, "!")?;
                     }

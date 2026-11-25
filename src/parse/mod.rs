@@ -835,8 +835,8 @@ pub enum SingleExpressionInner {
     List(Arc<[Expression]>),
     /// Infix operator expression: `lhs op rhs`
     BinaryOp(BinaryOp),
-    /// Logical negation: `!operand`
-    LogicalNot(LogicalNot),
+    /// Negation: `!operand`, logical on booleans and bitwise on integers
+    Not(Not),
 }
 
 impl_require_feature!(SingleExpressionInner {
@@ -859,7 +859,7 @@ impl_require_feature!(SingleExpressionInner {
         Array(exprs),
         List(exprs),
         BinaryOp(binary_op),
-        LogicalNot(logical_not),
+        Not(not),
 });
 
 /// Infix operator.
@@ -954,14 +954,14 @@ impl AsRef<Span> for BinaryOp {
     }
 }
 
-/// Logical negation: `!operand`.
+/// Negation: `!operand`, logical on booleans and bitwise on integers.
 #[derive(Clone, Debug)]
-pub struct LogicalNot {
+pub struct Not {
     operand: Arc<Expression>,
     span: Span,
 }
 
-impl LogicalNot {
+impl Not {
     /// Access the negated operand.
     pub fn operand(&self) -> &Expression {
         &self.operand
@@ -973,14 +973,14 @@ impl LogicalNot {
     }
 }
 
-impl_eq_hash!(LogicalNot; operand);
+impl_eq_hash!(Not; operand);
 
-impl_require_feature!(LogicalNot {
+impl_require_feature!(Not {
     requires: UnstableFeature::InfixOperators, span: span;
     recurse: operand;
 });
 
-impl AsRef<Span> for LogicalNot {
+impl AsRef<Span> for Not {
     fn as_ref(&self) -> &Span {
         &self.span
     }
@@ -1321,7 +1321,7 @@ pub enum ExprTree<'a> {
     EnumMatch(&'a EnumMatch),
     EnumConstruction(&'a EnumConstruction),
     BinaryOp(&'a BinaryOp),
-    LogicalNot(&'a LogicalNot),
+    Not(&'a Not),
 }
 
 impl TreeLike for ExprTree<'_> {
@@ -1370,7 +1370,7 @@ impl TreeLike for ExprTree<'_> {
                     Tree::Nary(elements.iter().map(Self::Expression).collect())
                 }
                 S::BinaryOp(binary_op) => Tree::Unary(Self::BinaryOp(binary_op)),
-                S::LogicalNot(logical_not) => Tree::Unary(Self::LogicalNot(logical_not)),
+                S::Not(not) => Tree::Unary(Self::Not(not)),
             },
             Self::Call(call) => Tree::Nary(call.args().iter().map(Self::Expression).collect()),
             Self::EnumConstruction(construction) => {
@@ -1385,7 +1385,7 @@ impl TreeLike for ExprTree<'_> {
                 Self::Expression(binary_op.lhs()),
                 Self::Expression(binary_op.rhs()),
             ])),
-            Self::LogicalNot(logical_not) => Tree::Unary(Self::Expression(logical_not.operand())),
+            Self::Not(not) => Tree::Unary(Self::Expression(not.operand())),
             Self::EnumMatch(enum_match) => Tree::Nary(
                 std::iter::once(Self::Expression(enum_match.scrutinee()))
                     .chain(

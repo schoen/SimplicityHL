@@ -296,8 +296,8 @@ impl AbstractSyntaxTree for SingleExpression {
             parse::SingleExpressionInner::BinaryOp(binary_op) => {
                 super::infix::analyze_binary(binary_op, ty, scope)?
             }
-            parse::SingleExpressionInner::LogicalNot(logical_not) => {
-                super::infix::analyze_not(logical_not, ty, scope)?
+            parse::SingleExpressionInner::Not(not) => {
+                super::infix::analyze_not(not, ty, scope)?
             }
         };
 

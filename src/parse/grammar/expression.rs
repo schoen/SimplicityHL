@@ -13,7 +13,7 @@ use crate::str::Identifier;
 use crate::TemplateProgramWitness;
 
 use super::super::{
-    BinaryOp, Call, EnumConstruction, Expression, ExpressionInner, InfixOp, LogicalNot,
+    BinaryOp, Call, EnumConstruction, Expression, ExpressionInner, InfixOp, Not,
     SingleExpression, SingleExpressionInner, Statement,
 };
 use super::matching::match_expr_parser;
@@ -251,7 +251,7 @@ impl SingleExpression {
             .foldr(atom, |bang, operand| {
                 let span = join_spans(bang, operand.span);
                 Self {
-                    inner: SingleExpressionInner::LogicalNot(LogicalNot {
+                    inner: SingleExpressionInner::Not(Not {
                         operand: Arc::new(operand.into_expression()),
                         span,
                     }),

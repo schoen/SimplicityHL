@@ -43,8 +43,8 @@ Operators on booleans and unsigned integers:
 | `==` `!=` | `bool` and every unsigned integer type | `bool` |
 | `<` `<=` `>` `>=` | every unsigned integer type | `bool` |
 | `&` `\|` `^` | `bool` and every unsigned integer type | the operand type |
+| `!` (prefix) | `bool` and every unsigned integer type | the operand type |
 | `&&` `\|\|` | `bool` | `bool` |
-| `!` (prefix) | `bool` | `bool` |
 
 Both operands of a binary operator must have the same type.
 

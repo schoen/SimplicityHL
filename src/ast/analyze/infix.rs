@@ -40,9 +40,9 @@ pub(super) fn analyze_binary(
             expect_boolean(ty).with_span(from)?;
             parse::SingleExpression::bool_match(lhs, rhs, boolean(true, span), span)
         }
-        InfixOp::BitAnd => bitwise(BitwiseJet::And, lhs, rhs, ty, span).with_span(from)?,
-        InfixOp::BitOr => bitwise(BitwiseJet::Or, lhs, rhs, ty, span).with_span(from)?,
-        InfixOp::BitXor => bitwise(BitwiseJet::Xor, lhs, rhs, ty, span).with_span(from)?,
+        InfixOp::BitAnd => bitwise(BitwiseJet::And, vec![lhs, rhs], ty, span).with_span(from)?,
+        InfixOp::BitOr => bitwise(BitwiseJet::Or, vec![lhs, rhs], ty, span).with_span(from)?,
+        InfixOp::BitXor => bitwise(BitwiseJet::Xor, vec![lhs, rhs], ty, span).with_span(from)?,
         op
         @ (InfixOp::Eq | InfixOp::Ne | InfixOp::Lt | InfixOp::Le | InfixOp::Gt | InfixOp::Ge) => {
             expect_boolean(ty).with_span(from)?;
@@ -59,18 +59,18 @@ pub(super) fn analyze_binary(
 
 /// Analyze `!operand`, which must be of type `ty`.
 ///
-/// `!a` is `<u1>::into(jet::complement_1(<bool>::into(a)))`, which costs less
-/// than a `match`.
+/// `!` is the bitwise complement, which on booleans is logical negation, as
+/// in Rust. `!a` on a boolean is
+/// `<u1>::into(jet::complement_1(<bool>::into(a)))`, which costs less than a
+/// `match`.
 pub(super) fn analyze_not(
-    from: &parse::LogicalNot,
+    from: &parse::Not,
     ty: &ResolvedType,
     scope: &mut Scope,
 ) -> Result<SingleExpressionInner, Failure> {
-    expect_boolean(ty).with_span(from)?;
-
     let span = *from.span();
-    let rewritten =
-        parse::SingleExpression::from_expression(negate(from.operand().clone(), span));
+    let rewritten = bitwise(BitwiseJet::Not, vec![from.operand().clone()], ty, span)
+        .with_span(from)?;
 
     analyze_rewritten(&rewritten, ty, scope)
 }
@@ -95,21 +95,24 @@ fn expect_boolean(ty: &ResolvedType) -> Result<(), Error> {
     }
 }
 
-/// The jets `and_N`, `or_N` and `xor_N` of a bitwise operator.
+/// The jets `and_N`, `or_N` and `xor_N` of a bitwise operator, and the jets
+/// `complement_N` of `!`.
 #[derive(Clone, Copy)]
 enum BitwiseJet {
     And,
     Or,
     Xor,
+    Not,
 }
 
 impl BitwiseJet {
-    /// The operator that the jets implement.
-    fn op(self) -> InfixOp {
+    /// The operator that the jets implement, as written in source code.
+    fn symbol(self) -> &'static str {
         match self {
-            Self::And => InfixOp::BitAnd,
-            Self::Or => InfixOp::BitOr,
-            Self::Xor => InfixOp::BitXor,
+            Self::And => InfixOp::BitAnd.as_str(),
+            Self::Or => InfixOp::BitOr.as_str(),
+            Self::Xor => InfixOp::BitXor.as_str(),
+            Self::Not => "!",
         }
     }
 
@@ -120,6 +123,7 @@ impl BitwiseJet {
             Self::And => "and",
             Self::Or => "or",
             Self::Xor => "xor",
+            Self::Not => "complement",
         };
         format!("{family}_{width}")
     }
@@ -154,11 +158,11 @@ impl CompareJet {
 }
 
 /// Rewrite a bitwise operator into jets for the width of `ty`, which is the
-/// type of both operands and of the result.
+/// type of every operand and of the result. `operands` are the two operands
+/// of `&`, `|` or `^`, or the one operand of `!`.
 fn bitwise(
     jet: BitwiseJet,
-    lhs: parse::Expression,
-    rhs: parse::Expression,
+    operands: Vec<parse::Expression>,
     ty: &ResolvedType,
     span: Span,
 ) -> Result<parse::SingleExpression, Error> {
@@ -166,11 +170,11 @@ fn bitwise(
     // on booleans after a cast in each direction:
     // `<u1>::into(jet::and_1(<bool>::into(a), <bool>::into(b)))`.
     if ty.is_boolean() {
-        let result = jet_call(
-            &jet.name(1),
-            vec![bool_to_u1(lhs, span), bool_to_u1(rhs, span)],
-            span,
-        );
+        let operands = operands
+            .into_iter()
+            .map(|operand| bool_to_u1(operand, span))
+            .collect();
+        let result = jet_call(&jet.name(1), operands, span);
         return Ok(parse::SingleExpression::from_expression(u1_to_bool(
             result, span,
         )));
@@ -178,7 +182,7 @@ fn bitwise(
 
     let Some(int) = ty.as_integer() else {
         return Err(Error::OperatorUnsupportedType {
-            op: jet.op().as_str(),
+            op: jet.symbol(),
             ty: ty.clone(),
         });
     };
@@ -187,27 +191,27 @@ fn bitwise(
     // There are no jets for `u2` and `u4`: use the `u8` jet on zero-extended
     // operands and keep the low bits of the result.
     if matches!(int, UIntType::U2 | UIntType::U4) {
-        let extended = parse::SingleExpression::jet_call(
-            &jet.name(8),
-            vec![extend_to_u8(lhs, int, span), extend_to_u8(rhs, int, span)],
-            span,
-        );
+        let operands = operands
+            .into_iter()
+            .map(|operand| extend_to_u8(operand, int, span))
+            .collect();
+        let extended = jet_call(&jet.name(8), operands, span);
         return Ok(parse::SingleExpression::jet_call(
             &format!("rightmost_8_{width}"),
-            vec![extended.into_expression()],
+            vec![extended],
             span,
         ));
     }
 
     Ok(parse::SingleExpression::from_expression(bitwise_jets(
-        jet, lhs, rhs, width, span,
+        jet, operands, width, span,
     )))
 }
 
 /// Apply the bitwise jet to operands of the given width. Above 64 bits,
-/// where there are no jets, split both operands into 64-bit limbs (see
-/// [`split_into_limbs`]), apply the jet to each pair of limbs, and join the
-/// results. For `a & b` on `u128`:
+/// where there are no jets, split the operands into 64-bit limbs (see
+/// [`split_into_limbs`]), apply the jet to the limbs at each position, and
+/// join the results. For `a & b` on `u128`:
 ///
 /// ```text
 /// {
@@ -218,25 +222,22 @@ fn bitwise(
 /// ```
 fn bitwise_jets(
     jet: BitwiseJet,
-    lhs: parse::Expression,
-    rhs: parse::Expression,
+    operands: Vec<parse::Expression>,
     width: usize,
     span: Span,
 ) -> parse::Expression {
     if width <= 64 {
-        return jet_call(&jet.name(width), vec![lhs, rhs], span);
+        return jet_call(&jet.name(width), operands, span);
     }
 
-    let (split, lhs_limbs, rhs_limbs) = split_into_limbs(lhs, rhs, width, span);
-    let results = lhs_limbs
-        .iter()
-        .zip(&rhs_limbs)
-        .map(|(lhs, rhs)| {
-            jet_call(
-                &jet.name(64),
-                vec![variable(lhs, span), variable(rhs, span)],
-                span,
-            )
+    let (split, limbs) = split_into_limbs(operands, width, span);
+    let results = (0..width / 64)
+        .map(|position| {
+            let args = limbs
+                .iter()
+                .map(|names| variable(&names[position], span))
+                .collect();
+            jet_call(&jet.name(64), args, span)
         })
         .collect();
     let joined =
@@ -375,7 +376,9 @@ fn borrow_chain(
     or_equal: bool,
     span: Span,
 ) -> parse::Expression {
-    let (split, lhs_limbs, rhs_limbs) = split_into_limbs(lhs, rhs, width, span);
+    let (split, limbs) = split_into_limbs(vec![lhs, rhs], width, span);
+    let [lhs_limbs, rhs_limbs]: [Vec<String>; 2] =
+        limbs.try_into().expect("there are two operands");
     let mut statements = vec![split];
 
     let (minuend, subtrahend) = if or_equal {
@@ -409,37 +412,53 @@ fn borrow_chain(
     parse::SingleExpression::block(statements, result, span)
 }
 
-/// Build the statement that splits both operands, of 128 or 256 bits, into
-/// 64-bit limbs, and return it with the names of the limbs of each operand,
-/// the least significant first:
+/// Build the statement that splits one or two operands, of 128 or 256 bits,
+/// into 64-bit limbs, and return it with the names of the limbs of each
+/// operand, the least significant first. For two operands of type `u128`:
 ///
 /// ```text
 /// let ((lhs_1, lhs_0), (rhs_1, rhs_0)): ((u64, u64), (u64, u64)) =
 ///     <(u128, u128)>::into((a, b));
 /// ```
 ///
-/// Both operands are evaluated, in order, before any name is bound. Code
+/// and for one, `let (operand_1, operand_0): (u64, u64) = <u128>::into(a);`.
+///
+/// The operands are evaluated, in order, before any name is bound. Code
 /// after the statement that refers only to the limbs, and to names it binds
 /// itself, can't capture any variable of the program.
 fn split_into_limbs(
-    lhs: parse::Expression,
-    rhs: parse::Expression,
+    mut operands: Vec<parse::Expression>,
     width: usize,
     span: Span,
-) -> (parse::Statement, Vec<String>, Vec<String>) {
-    let names = |side: &str| -> Vec<String> {
-        (0..width / 64).map(|i| format!("{side}_{i}")).collect()
+) -> (parse::Statement, Vec<Vec<String>>) {
+    let sides: &[&str] = match operands.len() {
+        1 => &["operand"],
+        2 => &["lhs", "rhs"],
+        n => unreachable!("an operator doesn't have {n} operands"),
     };
-    let lhs_limbs = names("lhs");
-    let rhs_limbs = names("rhs");
+    let limbs: Vec<Vec<String>> = sides
+        .iter()
+        .map(|side| (0..width / 64).map(|i| format!("{side}_{i}")).collect())
+        .collect();
 
-    let ty = AliasedType::tuple([limbs_type(width), limbs_type(width)]);
-    let pattern = Pattern::tuple([limbs_pattern(&lhs_limbs), limbs_pattern(&rhs_limbs)]);
-    let operands = parse::SingleExpression::tuple(vec![lhs, rhs], span).into_expression();
-    let split = parse::SingleExpression::type_cast(pair_type(uint(width)), operands, span)
-        .into_expression();
+    let (pattern, ty, source, value) = if operands.len() == 1 {
+        (
+            limbs_pattern(&limbs[0]),
+            limbs_type(width),
+            AliasedType::from(uint(width)),
+            operands.pop().expect("there is one operand"),
+        )
+    } else {
+        (
+            Pattern::tuple(limbs.iter().map(|names| limbs_pattern(names))),
+            AliasedType::tuple([limbs_type(width), limbs_type(width)]),
+            pair_type(uint(width)),
+            parse::SingleExpression::tuple(operands, span).into_expression(),
+        )
+    };
+    let split = parse::SingleExpression::type_cast(source, value, span).into_expression();
     let statement = parse::SingleExpression::assignment(pattern, ty, split, span);
-    (statement, lhs_limbs, rhs_limbs)
+    (statement, limbs)
 }
 
 /// The value of [`limbs_type`] made of `limbs`, which are listed the least
@@ -550,7 +569,9 @@ fn operand_type(expression: &parse::Expression, scope: &Scope) -> Option<Resolve
 
     match single.inner() {
         S::Variable(identifier) => scope.get_variable(identifier).cloned(),
-        S::Boolean(_) | S::LogicalNot(_) => Some(ResolvedType::boolean()),
+        S::Boolean(_) => Some(ResolvedType::boolean()),
+        // `!` has the type of its operand.
+        S::Not(not) => operand_type(not.operand(), scope),
         S::Expression(inner) => operand_type(inner, scope),
         S::BinaryOp(binary_op) => match binary_op.op() {
             InfixOp::BitAnd | InfixOp::BitOr | InfixOp::BitXor => {

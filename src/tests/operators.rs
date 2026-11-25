@@ -42,13 +42,12 @@ fn cmr(text: &str) -> simplicity::Cmr {
 /// Compile `text`, which must be rejected, and return the message of its
 /// first error together with the source text that the error points at.
 fn first_error(text: &str) -> (String, String) {
-    let diagnostics = match TemplateAst::new_with_unstable(
+    let Err(diagnostics) = TemplateAst::new_with_unstable(
         text,
         &UnstableFeatures::all(),
         Box::new(ElementsJetHinter::new()),
-    ) {
-        Ok(_) => panic!("Accepted faulty program:\n{text}"),
-        Err(diagnostics) => diagnostics,
+    ) else {
+        panic!("Accepted faulty program:\n{text}");
     };
     let diagnostic = diagnostics
         .diagnostics()
@@ -106,6 +105,19 @@ impl Word {
         Self {
             bits: 256,
             bytes: limbs.iter().flat_map(|limb| limb.to_be_bytes()).collect(),
+        }
+    }
+
+    /// The bitwise complement.
+    fn not(&self) -> Self {
+        let mask = if self.bits < 8 {
+            (1 << self.bits) - 1
+        } else {
+            0xff
+        };
+        Self {
+            bits: self.bits,
+            bytes: self.bytes.iter().map(|byte| !byte & mask).collect(),
         }
     }
 
@@ -171,7 +183,7 @@ fn all_operators_program(values: &[Word]) -> String {
 
     let mut text = format!(
         "fn check(a: {ty}, b: {ty}, eq: bool, ne: bool, lt: bool, le: bool, gt: bool, ge: bool, \
-         bit_and: {ty}, bit_or: {ty}, bit_xor: {ty}) {{\n"
+         bit_and: {ty}, bit_or: {ty}, bit_xor: {ty}, not_a: {ty}) {{\n"
     );
     for (op, expected) in [
         ("==", "eq"),
@@ -191,6 +203,7 @@ fn all_operators_program(values: &[Word]) -> String {
         )
         .unwrap();
     }
+    writeln!(text, "    assert!({});", same("!a", "not_a")).unwrap();
     text += "}\n\nfn main() {\n";
 
     for a in values {
@@ -198,7 +211,7 @@ fn all_operators_program(values: &[Word]) -> String {
             let order = a.bytes.cmp(&b.bytes);
             writeln!(
                 text,
-                "    check({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
+                "    check({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
                 a.literal(),
                 b.literal(),
                 order == Ordering::Equal,
@@ -210,6 +223,7 @@ fn all_operators_program(values: &[Word]) -> String {
                 a.zip(b, |x, y| x & y).literal(),
                 a.zip(b, |x, y| x | y).literal(),
                 a.zip(b, |x, y| x ^ y).literal(),
+                a.not().literal(),
             )
             .unwrap();
         }
@@ -404,6 +418,7 @@ fn operators_compile_to_hand_written_jets() {
         ("jet::eq_32(a & b, 0)", "jet::eq_32(jet::and_32(a, b), 0)".to_string()),
         ("jet::eq_32(a | b, 0)", "jet::eq_32(jet::or_32(a, b), 0)".to_string()),
         ("jet::eq_32(a ^ b, 0)", "jet::eq_32(jet::xor_32(a, b), 0)".to_string()),
+        ("jet::eq_32(!a, 0)", "jet::eq_32(jet::complement_32(a), 0)".to_string()),
         // Logical operators.
         ("p && q", "match p { false => false, true => q, }".to_string()),
         ("p || q", "match p { false => q, true => true, }".to_string()),
@@ -430,6 +445,11 @@ fn operators_compile_to_hand_written_jets() {
         (
             "s >= t",
             format!("jet::le_8({}, {})", u2_extended("t"), u2_extended("s")),
+        ),
+        (
+            "jet::eq_8(<(u4, u4)>::into((0, !x)), 0)",
+            "jet::eq_8(<(u4, u4)>::into((0, jet::rightmost_8_4(jet::complement_8(<(u4, u4)>::into((0, x)))))), 0)"
+                .to_string(),
         ),
         // Ordering on `u1`: `a < b` is `!a & b`, and `a <= b` is `!a | b`.
         (
@@ -464,6 +484,15 @@ fn operators_compile_to_hand_written_jets() {
          (((u64, u64), (u64, u64)), ((u64, u64), (u64, u64))) = <(u256, u256)>::into((g, h));
         <((u64, u64), (u64, u64))>::into(((jet::and_64(g3, h3), jet::and_64(g2, h2)), \
          (jet::and_64(g1, h1), jet::and_64(g0, h0))))
+    }, g)"
+                .to_string(),
+        ),
+        (
+            "jet::eq_256(!g, g)",
+            "jet::eq_256({
+        let ((g3, g2), (g1, g0)): ((u64, u64), (u64, u64)) = <u256>::into(g);
+        <((u64, u64), (u64, u64))>::into(((jet::complement_64(g3), jet::complement_64(g2)), \
+         (jet::complement_64(g1), jet::complement_64(g0))))
     }, g)"
                 .to_string(),
         ),
@@ -511,6 +540,8 @@ fn wide_comparisons_do_not_capture_variables() {
     assert!(lhs_0 & rhs_1 == 5);
     assert!(borrow | lhs_0 == 7);
     assert!(lhs_3 ^ rhs_0 == 0x0000000000000000000000000000000000000000000000000000000000000002);
+    let operand_0: u128 = 0xfffffffffffffffffffffffffffffffe;
+    assert!(!operand_0 == 1);
 }
 ");
 }
@@ -548,6 +579,9 @@ fn main() {
     assert!(sixteen(9) < 10);
     assert!(jet::current_index() <= 4294967295);
     assert!(jet::lock_time() >= 0);
+    // `!` on an integer has the integer's type.
+    assert!(!x == 252);
+    assert!(255 == !0 & !x | x);
     // Boolean operands.
     let a: u8 = 1;
     let b: u8 = 2;
@@ -684,6 +718,11 @@ fn operators_on_compound_types_are_rejected() {
             );
         }
     }
+
+    assert_compile_error(
+        "    let v: (u8, u8) = (1, 2);\n    let w: (u8, u8) = !v;",
+        "Operator `!` cannot be applied to values of type `(u8, u8)`",
+    );
 
     // An alias of a compound type is rejected with the type it stands for.
     let (message, _) = first_error(
@@ -849,15 +888,19 @@ fn hash_lock_with_timeout_wrong_preimage() {
 // Feature gating
 // ---------------------------------------------------------------------------
 
+/// A position for an operator expression in a program: given the expression,
+/// it returns a function to put before `main` (or an empty string) and a
+/// statement of `main`.
+type Position = fn(&str) -> (String, String);
+
 #[test]
 fn every_operator_needs_the_feature() {
     let operators = [
         "a == b", "a != b", "a < b", "a <= b", "a > b", "a >= b", "t & t", "t | t", "t ^ t",
         "t && t", "t || t", "!t",
     ];
-    // Positions that the feature check must visit: a statement of `main`,
-    // and an optional function before `main`.
-    let positions: [fn(&str) -> (String, String); 8] = [
+    // Positions that the feature check must visit.
+    let positions: [Position; 8] = [
         |e| (String::new(), format!("let c: bool = {e};")),
         |e| {
             (
@@ -1005,8 +1048,9 @@ fn operator_costs() {
                 "a",
             );
         }
+        row("!a", ty, ty, "!a", value, "a");
         if is_bool {
-            for e in ["a && b", "a || b", "!a"] {
+            for e in ["a && b", "a || b"] {
                 row(e, ty, "bool", e, value, "true");
             }
         }

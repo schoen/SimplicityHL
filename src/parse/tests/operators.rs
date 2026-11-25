@@ -17,8 +17,8 @@ fn shape(expression: &Expression) -> String {
                 binary_op.op(),
                 shape(binary_op.rhs())
             ),
-            SingleExpressionInner::LogicalNot(logical_not) => {
-                format!("(!{})", shape(logical_not.operand()))
+            SingleExpressionInner::Not(not) => {
+                format!("(!{})", shape(not.operand()))
             }
             _ => expression.to_string(),
         },
@@ -352,7 +352,7 @@ fn generated_operator_expressions_display_as_they_parse() {
         };
         let has_operator = ExprTree::Expression(&expression)
             .pre_order_iter()
-            .any(|node| matches!(node, ExprTree::BinaryOp(..) | ExprTree::LogicalNot(..)));
+            .any(|node| matches!(node, ExprTree::BinaryOp(..) | ExprTree::Not(..)));
         if !has_operator {
             continue;
         }
